@@ -105,10 +105,20 @@ class RegressionConfig(Config):
   loss: str = "rmse"
 
 
-# Process-wide cache of restored models, keyed by load settings. The restored
-# weights are immutable and shared safely across callers (e.g. AutoGluon /
-# TabArena bagging fits many child models in one process), so this avoids
-# re-running the ~19s Orbax checkpoint restore on every call.
+# Process-wide memo of restored models. Caching avoids re-running the ~19s
+# Orbax checkpoint restore on every call (e.g. AutoGluon / TabArena bagging
+# fits many child models in one process); the restored weights are immutable
+# and shared safely across callers.
+#
+# It is a dict keyed by load settings (model_type, checkpoint_path, step,
+# attention_impl, dtype) rather than a single slot for two reasons:
+#   1. Distinct variants can coexist in one process -- most commonly the
+#      classification and regression models -- so a single slot would evict
+#      one whenever the other is loaded and re-pay the restore each switch.
+#   2. Correctness: these settings change which weights/architecture you get,
+#      so the key guarantees we never return a model loaded with settings
+#      different from those requested. (Equivalent to functools.lru_cache on
+#      the arguments; kept explicit for the use_cache=False escape hatch.)
 _LOAD_CACHE: Dict[Any, "TabFM"] = {}
 
 
