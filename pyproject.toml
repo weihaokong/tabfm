@@ -4,7 +4,7 @@
 name = "tabfm"
 description = ""
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 license = {file = "LICENSE"}
 authors = [{name = "tabfm authors", email="tabfm@google.com"}]
 classifiers = [  # List of https://pypi.org/classifiers/
@@ -16,19 +16,26 @@ keywords = []
 # pip dependencies of the project
 # Installed locally with `pip install -e .`
 # Pinned versions for the full reproducible environment are in requirements.txt.
+# Only the deps with known incompatibilities are constrained; the rest float.
+#   - flax>=0.12.7 provides nnx.ModelAndOptimizer (used in checkpointing.py);
+#     it also requires Python >=3.11.
+#   - jaxtyping<0.3 / typeguard<3: jaxtyping 0.2.x integrates with typeguard 2.x;
+#     newer typeguard (4.x) rejects jaxtyping's shape-string annotations.
+# requirements.txt remains the full pinned lock for a reproducible environment.
 dependencies = [
     "absl-py",
     "chex",
     "einops",
-    "flax",
+    "flax>=0.12.7",
     "jax",
     "jaxlib",
-    "jaxtyping",
+    "jaxtyping<0.3",
     "numpy",
     "optax",
     "orbax-checkpoint",
     "pandas",
     "scikit-learn",
+    "typeguard<3",
     "huggingface-hub",
 ]
 

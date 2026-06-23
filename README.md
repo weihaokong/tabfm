@@ -27,7 +27,7 @@ pip install -e .[cuda]
 
 ### Requirements
 For a complete list of pinned dependencies and versions, please see [requirements.txt](requirements.txt). The core requirements are:
-*   Python >= 3.10
+*   Python >= 3.11
 *   JAX (specifically `jax==0.10.1`)
 *   Flax (specifically `flax==0.12.7`, using the modern `flax.nnx` API)
 *   Hugging Face Hub (for downloading pre-trained weights)
