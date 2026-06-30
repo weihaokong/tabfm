@@ -95,7 +95,11 @@ def run_example(model=None):
     A dict mapping "default"/"ensemble" to a (roc_auc, log_loss) tuple.
   """
   if model is None:
-    model = tabfm.tabfm_v1_0_0.load(model_type="classification")
+    # Option A: JAX Backend (default)
+    model = tabfm.tabfm_v1_0_0_jax.load(model_type="classification")
+
+    # Option B: PyTorch Backend
+    # model = tabfm.tabfm_v1_0_0_pytorch.load(model_type="classification")
 
   x_train, y_train, x_test, y_test = _load_fold_0(TASK_ID)
 
@@ -114,7 +118,7 @@ def run_example(model=None):
 if __name__ == "__main__":
   print(
       "Running TabFM classification on TabArena maternal_health_risk (fold 0)..."
-      " (Note: JAX compilation and model execution may take a few minutes on"
+      " (Note: compilation and model execution may take a few minutes on"
       " first run)"
   )
   scores = run_example()

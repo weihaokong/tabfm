@@ -15,9 +15,16 @@
 """tabfm API."""
 
 try:
-  from tabfm.src.jax import tabfm_v1_0_0
+  from tabfm.src.jax import tabfm_v1_0_0 as tabfm_v1_0_0_jax
+  tabfm_v1_0_0 = tabfm_v1_0_0_jax
 except ImportError:
-  # JAX is not installed or incomplete, tabfm_v1_0_0 (JAX version) is not available.
+  # JAX is not installed or incomplete, tabfm_v1_0_0_jax is not available.
+  pass
+
+try:
+  from tabfm.src.pytorch import tabfm_v1_0_0 as tabfm_v1_0_0_pytorch
+except ImportError:
+  # PyTorch is not installed or incomplete, tabfm_v1_0_0_pytorch is not available.
   pass
 
 from tabfm.src.classifier_and_regressor import TabFMClassifier, TabFMRegressor

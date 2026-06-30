@@ -22,7 +22,11 @@ import tabfm
 def run_example(model=None) -> np.ndarray:
   """Generates dummy data and runs classification."""
   if model is None:
-    model = tabfm.tabfm_v1_0_0.load(model_type="classification")
+    # Option A: JAX Backend (default)
+    model = tabfm.tabfm_v1_0_0_jax.load(model_type="classification")
+
+    # Option B: PyTorch Backend
+    # model = tabfm.tabfm_v1_0_0_pytorch.load(model_type="classification")
 
   # 2. Initialize scikit-learn compatible classifier
   clf = tabfm.TabFMClassifier(model=model)
@@ -52,6 +56,6 @@ def run_example(model=None) -> np.ndarray:
 
 
 if __name__ == "__main__":
-  print("Running TabFM classification model... (Note: JAX compilation and model execution may take a few minutes on first run)")
+  print("Running TabFM classification model... (Note: compilation and model execution may take a few minutes on first run)")
   predictions = run_example()
   print("Classification predictions:\n", predictions)

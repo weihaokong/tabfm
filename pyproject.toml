@@ -24,21 +24,13 @@ keywords = []
 # requirements.txt remains the full pinned lock for a reproducible environment.
 dependencies = [
     "absl-py",
-    "chex",
-    "einops",
-    "flax>=0.12.7",
-    "jax",
-    "jaxlib",
     "jaxtyping<0.3",
     "numpy",
-    "optax",
-    "orbax-checkpoint",
     "pandas",
     "scikit-learn",
     "scipy",
     "typeguard<3",
     "huggingface-hub",
-    "torch",
 ]
 
 # `version` is automatically set by flit to use `tabfm.__version__`
@@ -51,6 +43,20 @@ changelog = "https://github.com/google-research/tabfm/blob/main/CHANGELOG.md"
 # documentation = ""
 
 [project.optional-dependencies]
+# Backend extras
+jax = [
+    "chex",
+    "einops",
+    "flax>=0.12.7",
+    "jax",
+    "jaxlib",
+    "optax",
+    "orbax-checkpoint",
+]
+pytorch = [
+    "torch",
+]
+
 # Development deps (unittest, linting, formating,...)
 # Installed through `pip install -e .[dev]`
 dev = [

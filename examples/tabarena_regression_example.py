@@ -84,7 +84,11 @@ def run_example(model=None):
     A dict mapping "default"/"ensemble" to an (rmse, r2, mae) tuple.
   """
   if model is None:
-    model = tabfm.tabfm_v1_0_0.load(model_type="regression")
+    # Option A: JAX Backend (default)
+    model = tabfm.tabfm_v1_0_0_jax.load(model_type="regression")
+
+    # Option B: PyTorch Backend
+    # model = tabfm.tabfm_v1_0_0_pytorch.load(model_type="regression")
 
   x_train, y_train, x_test, y_test = _load_fold_0(TASK_ID)
 
@@ -103,7 +107,7 @@ def run_example(model=None):
 if __name__ == "__main__":
   print(
       "Running TabFM regression on TabArena airfoil_self_noise"
-      " (fold 0)... (Note: JAX compilation and model execution may take a few"
+      " (fold 0)... (Note: compilation and model execution may take a few"
       " minutes on first run)"
   )
   scores = run_example()

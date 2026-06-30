@@ -22,6 +22,10 @@ from tabfm.src.jax import checkpointing
 from tabfm.src.jax import model as tabfm_model
 
 from absl.testing import absltest
+from absl import flags
+import sys
+if not flags.FLAGS.is_parsed():
+  flags.FLAGS(sys.argv[:1])
 
 
 class DummyDatasetIter:

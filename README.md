@@ -10,49 +10,67 @@ At inference time, TabFM does not require training parameters on your dataset; i
 
 ## Installation
 
-To install TabFM, clone the repository and install it locally:
+To install TabFM, clone the repository and install it locally with the backend of your choice:
 
+**JAX (CPU):**
 ```bash
 git clone https://github.com/google-research/tabfm.git
 cd tabfm
-pip install -e .
+pip install -e .[jax]
 ```
 
-The base install uses CPU-only JAX. For GPU execution, install the `cuda`
-extra to pull the CUDA 12 plugin and NVIDIA libraries:
-
+**JAX (GPU):**
 ```bash
-pip install -e .[cuda]
+git clone https://github.com/google-research/tabfm.git
+cd tabfm
+pip install -e .[jax,cuda]
 ```
+
+**PyTorch (CPU/GPU):**
+```bash
+git clone https://github.com/google-research/tabfm.git
+cd tabfm
+pip install -e .[pytorch]
+```
+*Note: For PyTorch with GPU support, ensure you have the appropriate PyTorch version installed for your CUDA version before installing TabFM.*
 
 ### Requirements
-For a complete list of pinned dependencies and versions, please see [requirements.txt](requirements.txt). The core requirements are:
+For a complete list of pinned dependencies and versions, please see [requirements.txt](requirements.txt). The core requirements depend on the backend you choose:
 *   Python >= 3.11
-*   JAX (specifically `jax==0.10.1`)
-*   Flax (specifically `flax==0.12.7`, using the modern `flax.nnx` API)
 *   Hugging Face Hub (for downloading pre-trained weights)
+*   **JAX Backend:**
+    *   JAX (specifically `jax==0.10.1`)
+    *   Flax (specifically `flax==0.12.7`, using the modern `flax.nnx` API)
+*   **PyTorch Backend:**
+    *   PyTorch (specifically `torch==2.12.1+cpu` or a GPU version)
 
 ---
 
 ## Quick Start (TabFM v1.0.0)
 
-We provide pre-trained weights for the **TabFM v1.0.0** release. The library handles downloading and loading these weights automatically using the `tabfm_v1_0_0` model release package.
+We provide pre-trained weights for the **TabFM v1.0.0** release. The library handles downloading and loading these weights automatically. You can choose to load the model using either the JAX or PyTorch backend.
 
 ### 1. Classification Example
 
 ```python
 import numpy as np
 import pandas as pd
-from tabfm import tabfm_v1_0_0
 from tabfm import TabFMClassifier
 
-# 1. Load pre-trained TabFM v1.0.0 model (automatically downloads from Hugging Face)
+# Choose your backend:
+
+# OPTION A: JAX Backend
+from tabfm import tabfm_v1_0_0_jax as tabfm_v1_0_0
 model = tabfm_v1_0_0.load()
 
-# 2. Initialize scikit-learn compatible classifier
+# OPTION B: PyTorch Backend
+# from tabfm import tabfm_v1_0_0_pytorch as tabfm_v1_0_0
+# model = tabfm_v1_0_0.load()
+
+# Initialize scikit-learn compatible classifier (works with either backend model)
 clf = TabFMClassifier(model=model)
 
-# 3. Prepare your dataset (supports mixed numerical and categorical features)
+# Prepare your dataset (supports mixed numerical and categorical features)
 X_train = pd.DataFrame({
     "age": [25.0, 45.0, 35.0, 50.0],
     "job": ["engineer", "manager", "engineer", "manager"],
@@ -66,10 +84,10 @@ X_test = pd.DataFrame({
     "income": [85000, 125000]
 })
 
-# 4. Fit classifier (prepares ordinal encoders and numerical scalers)
+# Fit classifier (prepares ordinal encoders and numerical scalers)
 clf.fit(X_train, y_train)
 
-# 5. Predict classes and probabilities
+# Predict classes and probabilities
 predictions = clf.predict(X_test)
 probabilities = clf.predict_proba(X_test)
 
@@ -82,16 +100,22 @@ print("Class Probabilities:\n", probabilities)
 ```python
 import numpy as np
 import pandas as pd
-from tabfm import tabfm_v1_0_0
 from tabfm import TabFMRegressor
 
-# 1. Load pre-trained TabFM v1.0.0 model
+# Choose your backend:
+
+# OPTION A: JAX Backend
+from tabfm import tabfm_v1_0_0_jax as tabfm_v1_0_0
 model = tabfm_v1_0_0.load()
 
-# 2. Initialize scikit-learn compatible regressor
+# OPTION B: PyTorch Backend
+# from tabfm import tabfm_v1_0_0_pytorch as tabfm_v1_0_0
+# model = tabfm_v1_0_0.load()
+
+# Initialize scikit-learn compatible regressor (works with either backend model)
 reg = TabFMRegressor(model=model)
 
-# 3. Prepare your dataset
+# Prepare your dataset
 X_train = pd.DataFrame({
     "sqft": [1200, 2500, 1500, 3000],
     "neighborhood": ["A", "B", "A", "C"]
@@ -103,7 +127,7 @@ X_test = pd.DataFrame({
     "neighborhood": ["A", "B"]
 })
 
-# 4. Fit and Predict
+# Fit and Predict
 reg.fit(X_train, y_train)
 predictions = reg.predict(X_test)
 
@@ -122,12 +146,24 @@ To run them, simply execute:
 ```bash
 python examples/classification_example.py
 ```
+*(You can edit these files to switch between JAX and PyTorch backends as shown in the comments inside them).*
 
 ---
 
 ## Running Tests
 
-To run the unit tests using Bazel:
+You can run the unit tests directly using Python's `unittest` module:
+
+```bash
+# Run all tests (requires both JAX and PyTorch installed)
+PYTHONPATH=. python3 -m unittest discover -s tabfm/src/ -p "*_test.py"
+
+# Or run specific test files:
+PYTHONPATH=. python3 -m unittest tabfm/src/pytorch/model_test.py
+PYTHONPATH=. python3 -m unittest tabfm/src/classifier_and_regressor_pytorch_test.py
+```
+
+Alternatively, if you have Bazel installed, you can run tests with:
 ```bash
 bazel test //...
 ```
