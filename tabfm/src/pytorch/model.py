@@ -30,7 +30,6 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
-from huggingface_hub import PyTorchModelHubMixin
 
 
 def get_activation(name):
@@ -418,12 +417,7 @@ class ICLearning(nn.Module):
     return self.decoder(self.ln(out))
 
 
-class TabFM(
-    nn.Module,
-    PyTorchModelHubMixin,
-    repo_url="https://github.com/google-research/tabfm",
-    license="other",
-):
+class TabFM(nn.Module):
   def __init__(self, *, embed_dim=8, max_classes=3, col_num_blocks=2,
                col_nhead=2, col_num_inds=4, row_num_blocks=2, row_nhead=2,
                row_num_cls=2, icl_num_blocks=2, icl_nhead=2, ff_factor=2,
@@ -457,119 +451,3 @@ class TabFM(
     emb = self.col_embedder_2(emb, train_size)
     reps = self.row_interactor_2(emb, d=d)
     return self.icl_predictor(reps, y, train_size)
-
-  @classmethod
-  def _from_pretrained(
-      cls,
-      *,
-      model_id,
-      revision,
-      cache_dir,
-      force_download,
-      local_files_only,
-      token,
-      map_location="cpu",
-      strict=True,
-      **model_kwargs,
-  ):
-    import json as _json
-    import os as _os
-    from huggingface_hub import hf_hub_download, constants
-    from huggingface_hub.utils import EntryNotFoundError
-
-    subfolder = model_kwargs.pop("subfolder", None)
-
-    def _clean_config(cfg):
-      if "is_classifier" not in model_kwargs and "task" in cfg:
-        model_kwargs["is_classifier"] = cfg.pop("task") == "classification"
-      for key in ("model_type", "version", "framework"):
-        cfg.pop(key, None)
-      for k, v in cfg.items():
-        if k not in model_kwargs:
-          model_kwargs[k] = v
-
-    # translate root-level config keys already merged into model_kwargs
-    if "is_classifier" not in model_kwargs and "task" in model_kwargs:
-      model_kwargs["is_classifier"] = (
-          model_kwargs.pop("task") == "classification"
-      )
-    for key in ("model_type", "version", "framework"):
-      model_kwargs.pop(key, None)
-
-    if subfolder is None:
-      return super()._from_pretrained(
-          model_id=model_id,
-          revision=revision,
-          cache_dir=cache_dir,
-          force_download=force_download,
-          local_files_only=local_files_only,
-          token=token,
-          map_location=map_location,
-          strict=strict,
-          **model_kwargs,
-      )
-
-    # subfolder path: download config + weights from the named subfolder
-    if _os.path.isdir(model_id):
-      sub_dir = _os.path.join(model_id, subfolder)
-      cfg_path = _os.path.join(sub_dir, constants.CONFIG_NAME)
-      if _os.path.exists(cfg_path):
-        with open(cfg_path) as f:
-          _clean_config(_json.load(f))
-      return super()._from_pretrained(
-          model_id=sub_dir,
-          revision=revision,
-          cache_dir=cache_dir,
-          force_download=force_download,
-          local_files_only=local_files_only,
-          token=token,
-          map_location=map_location,
-          strict=strict,
-          **model_kwargs,
-      )
-
-    # hub repo: fetch subfolder config.json then weights
-    try:
-      cfg_file = hf_hub_download(
-          repo_id=model_id,
-          filename=constants.CONFIG_NAME,
-          subfolder=subfolder,
-          revision=revision,
-          cache_dir=cache_dir,
-          force_download=force_download,
-          token=token,
-          local_files_only=local_files_only,
-      )
-      with open(cfg_file) as f:
-        _clean_config(_json.load(f))
-    except EntryNotFoundError:
-      pass
-
-    model = cls(**model_kwargs)
-    for filename in (
-        constants.SAFETENSORS_SINGLE_FILE,
-        constants.PYTORCH_WEIGHTS_NAME,
-    ):
-      try:
-        wt_file = hf_hub_download(
-            repo_id=model_id,
-            filename=filename,
-            subfolder=subfolder,
-            revision=revision,
-            cache_dir=cache_dir,
-            force_download=force_download,
-            token=token,
-            local_files_only=local_files_only,
-        )
-        if filename == constants.SAFETENSORS_SINGLE_FILE:
-          return cls._load_as_safetensor(model, wt_file, map_location, strict)
-        import torch as _torch
-
-        model.load_state_dict(
-            _torch.load(wt_file, map_location=map_location, weights_only=True),
-            strict=strict,
-        )
-        return model
-      except EntryNotFoundError:
-        continue
-    raise OSError(f"No weight file found in {model_id}/{subfolder}")

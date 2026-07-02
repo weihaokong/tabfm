@@ -26,6 +26,7 @@ from jaxtyping import Float, Int
 
 from tabfm.src.jax import tabfm_v1_0_0
 from tabfm.src.pytorch import model as MT
+from tabfm.src.pytorch.tabfm_v1_0_0 import TabFM_HF
 from tabfm.src.hugging_face.torch_convert import jax_params, convert
 
 # Architecture config of the v1.0.0 checkpoint.
@@ -80,7 +81,7 @@ flags.DEFINE_string(
 def convert_model(
     model_type: Literal["classification", "regression"],
     checkpoint_path: Optional[str] = None,
-) -> Tuple[MT.TabFM, float]:
+) -> Tuple[TabFM_HF, float]:
   """Converts JAX checkpoint of model_type to PyTorch TabFM and runs parity verification."""
   logging.info("Loading JAX %s model...", model_type)
   is_classifier = (model_type == "classification")
@@ -97,7 +98,7 @@ def convert_model(
   decoder_hidden = jp["icl_predictor.decoder.layers.0.kernel"].shape[1]
   
   logging.info("Instantiating PyTorch model...")
-  torch_model = MT.TabFM(
+  torch_model = TabFM_HF(
       decoder_hidden=decoder_hidden,
       is_classifier=is_classifier,
       **V1_0_0_CONFIG,
@@ -150,7 +151,7 @@ def verify_parity(
 
 
 def save_checkpoint(
-    model: MT.TabFM,
+    model: TabFM_HF,
     output_dir: str,
     model_type: str,
 ) -> str:
