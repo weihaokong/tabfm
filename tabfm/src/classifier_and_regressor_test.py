@@ -645,6 +645,63 @@ class BatchForwardTest(absltest.TestCase):
 
 
 @unittest.skipUnless(HAS_JAX, "JAX is required")
+class ModelTypeMismatchTest(absltest.TestCase):
+  """Using the wrong checkpoint type fails fast with an actionable error."""
+
+  def _tiny_model(self, loss):
+    return tabfm_model.TabFM(
+        loss=loss,
+        max_classes=10,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        rngs=nnx.Rngs(0),
+    )
+
+  def test_regressor_predict_raises_on_classification_model(self):
+    regressor = TabFMRegressor(
+        model=self._tiny_model("cross_entropy"), n_estimators=2
+    )
+    X = np.random.rand(10, 3)
+    regressor.fit(X, np.random.rand(10))
+
+    with self.assertRaisesRegex(ValueError, "model_type='regression'"):
+      regressor.predict(np.random.rand(4, 3))
+
+  def test_regressor_predict_oof_raises_on_classification_model(self):
+    regressor = TabFMRegressor(
+        model=self._tiny_model("cross_entropy"), n_estimators=2
+    )
+    X = np.random.rand(10, 3)
+    regressor.fit(X, np.random.rand(10))
+
+    with self.assertRaisesRegex(ValueError, "model_type='regression'"):
+      regressor.predict_oof(cv=2)
+
+  def test_classifier_predict_proba_raises_on_regression_model(self):
+    classifier = TabFMClassifier(model=self._tiny_model("rmse"), n_estimators=2)
+    X = np.random.rand(10, 3)
+    classifier.fit(X, np.array([0, 1] * 5))
+
+    with self.assertRaisesRegex(ValueError, "fit on 2 classes"):
+      classifier.predict_proba(np.random.rand(4, 3))
+
+  def test_classifier_predict_oof_proba_raises_on_regression_model(self):
+    classifier = TabFMClassifier(model=self._tiny_model("rmse"), n_estimators=2)
+    X = np.random.rand(10, 3)
+    classifier.fit(X, np.array([0, 1] * 5))
+
+    with self.assertRaisesRegex(ValueError, "fit on 2 classes"):
+      classifier.predict_oof_proba(cv=2)
+
+
+@unittest.skipUnless(HAS_JAX, "JAX is required")
 class CalibrationTest(absltest.TestCase):
 
   def setUp(self):

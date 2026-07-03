@@ -1816,6 +1816,49 @@ def _predict_step_pytorch(
   return out_t.float().cpu().numpy()  # upcast: numpy has no bfloat16
 
 
+def _check_classifier_output_dim(output_dim: int, n_classes: int) -> None:
+  """Validates that the model produces logits for all target classes.
+
+  Args:
+    output_dim: Size of the model output's last axis.
+    n_classes: Number of classes seen during fit.
+
+  Raises:
+    ValueError: If the model outputs fewer values per row than there are
+      classes, which usually means a regression checkpoint is being used for
+      classification.
+  """
+  if output_dim < n_classes:
+    raise ValueError(
+        f"The model returned {output_dim} value(s) per row, but this"
+        f" TabFMClassifier was fit on {n_classes} classes. This usually means"
+        " a regression checkpoint is being used for classification. Load the"
+        " classification weights instead, e.g."
+        " `tabfm_v1_0_0.load(model_type='classification')`."
+    )
+
+
+def _check_regressor_output_dim(output_dim: int) -> None:
+  """Validates that the model produces scalar regression outputs.
+
+  Args:
+    output_dim: Size of the model output's last axis.
+
+  Raises:
+    ValueError: If the model outputs more than one value per row, which
+      usually means a classification checkpoint is being used for regression.
+  """
+  if output_dim != 1:
+    raise ValueError(
+        f"The model returned {output_dim} values per row, but TabFMRegressor"
+        " expects a single regression output. This usually means a"
+        " classification checkpoint is being used for regression; note that"
+        " `tabfm_v1_0_0.load()` defaults to the classification weights. Load"
+        " the regression weights instead with"
+        " `tabfm_v1_0_0.load(model_type='regression')`."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Classifier
 # ---------------------------------------------------------------------------
@@ -2459,6 +2502,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       out = self._batch_forward(
           Xs_batch, ys_batch, cat_masks_batch, ds=ds_batch
       )
+      _check_classifier_output_dim(out.shape[-1], n_classes)
       out = out[..., :n_classes]
 
       for i, (_, shift_offset, _, _) in enumerate(configs_flat):
@@ -2606,6 +2650,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     ) = self.ensemble_generator_.prepare_ensemble_tensors(data)
 
     outputs = self._batch_forward(Xs_all, ys_all, cat_masks_all, ds=ds_all)
+    _check_classifier_output_dim(outputs.shape[-1], self.n_classes_)
     outputs = outputs[..., :self.n_classes_]
 
     # Extract class shift offsets from ensemble generator
@@ -3245,6 +3290,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       out = self._batch_forward(
           Xs_batch, ys_batch, cat_masks_batch, ds=ds_batch
       )
+      _check_regressor_output_dim(out.shape[-1])
 
       preds = out.squeeze(-1)
 
@@ -3270,6 +3316,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     ) = self.ensemble_generator_.prepare_ensemble_tensors(data)
 
     output = self._batch_forward(Xs_all, ys_all, cat_masks_all, ds=ds_all)
+    _check_regressor_output_dim(output.shape[-1])
     predictions = output.squeeze(-1)
     return predictions
 
