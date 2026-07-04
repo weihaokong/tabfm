@@ -32,10 +32,17 @@ import torch.nn.functional as F
 from torch import nn
 
 
-def get_activation(name):
+def _gelu_tanh(x):
   # jax.nn.gelu defaults to the tanh approximation -> match it.
+  return F.gelu(x, approximate="tanh")
+
+
+def get_activation(name):
+  # Activations are stored as module attributes (e.g. MLP.act), so they must be
+  # picklable for AutoGluon/TabArena's pickle-based save. A module-level
+  # function pickles by reference; a lambda would not.
   return {"relu": F.relu,
-          "gelu": lambda x: F.gelu(x, approximate="tanh"),
+          "gelu": _gelu_tanh,
           "silu": F.silu}[name]
 
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pickle
 import unittest
 from unittest import mock
 import numpy as np
@@ -99,6 +100,56 @@ class PyTorchClassifierRegressorTest(unittest.TestCase):
     # Predict
     preds = reg.predict(X)
     self.assertEqual(preds.shape, (10,))
+
+
+class PyTorchModelPickleTest(unittest.TestCase):
+  """The PyTorch model must be picklable.
+
+  AutoGluon / TabArena save the fitted estimator (which holds the model) with
+  stdlib pickle. The encode/decode heads are gelu ``MLP``s whose activation was
+  previously a lambda from ``get_activation`` -- unpicklable -- so this guards
+  against that regression. The regression path builds three such heads
+  (y_embedder, y_encoder, decoder), so it exercises the activation most.
+  """
+
+  def _tiny_model(self, is_classifier):
+    return pytorch_model.TabFM(
+        embed_dim=8,
+        max_classes=3,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=2,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        ff_factor=2,
+        feature_group_size=2,
+        is_classifier=is_classifier,
+    )
+
+  def test_classifier_model_pickle_round_trip(self):
+    restored = pickle.loads(pickle.dumps(self._tiny_model(is_classifier=True)))
+    self.assertIsInstance(restored, pytorch_model.TabFM)
+
+  def test_regressor_model_pickle_round_trip(self):
+    restored = pickle.loads(pickle.dumps(self._tiny_model(is_classifier=False)))
+    self.assertIsInstance(restored, pytorch_model.TabFM)
+
+  def test_pickle_preserves_forward_output(self):
+    # The unpickled model must still run and produce identical outputs: the
+    # promoted _gelu_tanh is numerically identical to the previous lambda.
+    torch.manual_seed(0)
+    model = self._tiny_model(is_classifier=True).eval()
+    x = torch.randn(2, 4, 6)  # [B, T, H]
+    y = torch.randint(0, 3, (2, 4))  # [B, T]
+    train_size = torch.tensor([2, 3])  # [B]
+    with torch.no_grad():
+      before = model(x, y, train_size)
+      restored = pickle.loads(pickle.dumps(model)).eval()
+      after = restored(x, y, train_size)
+    torch.testing.assert_close(before, after)
 
 
 if __name__ == "__main__":
