@@ -1113,5 +1113,40 @@ class DatetimeDetectionTest(absltest.TestCase):
     self.assertFalse(_looks_like_datetime(pd.Series(vals, dtype="string")))
 
 
+class ColumnNameRobustnessTest(absltest.TestCase):
+
+  def test_duplicate_column_names_raise_a_clear_error(self):
+    # Joins/concats commonly produce duplicate column names. sklearn's
+    # ColumnTransformer cannot process them, so fail fast with an actionable
+    # message instead of the cryptic "'DataFrame' object has no attribute
+    # 'dtype'" raised previously.
+    X = pd.DataFrame(
+        [[1.0, "x", 2.0], [3.0, "y", 4.0], [5.0, "x", 6.0]],
+        columns=["a", "b", "a"],
+    )
+
+    with self.assertRaisesRegex(ValueError, r"duplicate column names.*'a'"):
+      TransformToNumerical(min_cat_frequency=1).fit(X)
+
+  def test_classifier_fit_duplicate_column_names_raises_clear_error(self):
+    classifier = TabFMClassifier(
+        model=mock.Mock(max_classes=10), n_estimators=2
+    )
+    X = pd.DataFrame(np.random.rand(10, 2), columns=["a", "a"])
+    y = np.array([0, 1] * 5)
+
+    with self.assertRaisesRegex(ValueError, "duplicate column names"):
+      classifier.fit(X, y)
+
+  def test_datetime_column_with_non_string_name(self):
+    # DataFrames built from arrays get integer column labels; the datetime
+    # expansion used to crash on `0 + "."` when building derived names.
+    X = pd.DataFrame({0: pd.date_range("2020-01-01", periods=4, freq="D")})
+
+    out = TransformToNumerical().fit_transform(X)
+
+    self.assertEqual(out.shape, (4, 5))  # unix-ns + 4 derived features
+
+
 if __name__ == "__main__":
   absltest.main()

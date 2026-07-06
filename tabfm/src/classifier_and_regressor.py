@@ -297,8 +297,8 @@ class DatetimeTransformer(BaseEstimator, TransformerMixin):
   dayofweek) in addition to its Unix-nanosecond integer representation.
   """
 
-  features_in: List[str]
-  _fillna_map: Dict[str, Any]
+  features_in: List[int]
+  _fillna_map: Dict[int, Any]
 
   def __init__(self, features: Optional[List[str]] = None):
     """Initialises the transformer.
@@ -326,12 +326,14 @@ class DatetimeTransformer(BaseEstimator, TransformerMixin):
     """
     if not isinstance(X, pd.DataFrame):
       X = pd.DataFrame(X)
-    self.features_in = list(X.columns)
-    for feature in self.features_in:
+    # Track columns by position: non-string column names would break the
+    # synthetic "<column>.<part>" labels built in transform().
+    self.features_in = list(range(X.shape[1]))
+    for pos in self.features_in:
       series = pd.to_datetime(
-          X[feature], utc=True, errors="coerce", format="mixed"
+          X.iloc[:, pos], utc=True, errors="coerce", format="mixed"
       )
-      self._fillna_map[feature] = series.mean()
+      self._fillna_map[pos] = series.mean()
     return self
 
   def transform(self, X: Any) -> np.ndarray:
@@ -346,18 +348,18 @@ class DatetimeTransformer(BaseEstimator, TransformerMixin):
     if not isinstance(X, pd.DataFrame):
       X = pd.DataFrame(X)
     X_datetime = pd.DataFrame(index=X.index)
-    for feature in self.features_in:
+    for pos in self.features_in:
       series = pd.to_datetime(
-          X[feature].copy(), utc=True, errors="coerce", format="mixed"
+          X.iloc[:, pos].copy(), utc=True, errors="coerce", format="mixed"
       )
       broken_idx = series[
           (series == "NaT") | series.isna() | series.isnull()
       ].index
       if len(broken_idx) > 0:
-        series.loc[broken_idx] = self._fillna_map[feature]
-      X_datetime[feature] = pd.to_numeric(series)
+        series.loc[broken_idx] = self._fillna_map[pos]
+      X_datetime[f"{pos}"] = pd.to_numeric(series)
       for dt_feature in self.features:
-        X_datetime[feature + "." + dt_feature] = getattr(
+        X_datetime[f"{pos}.{dt_feature}"] = getattr(
             series.dt, dt_feature
         ).astype(np.int64)
     return X_datetime.values
@@ -414,25 +416,33 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
       self.tfm_ = FunctionTransformer()
       return self
 
-    datetime_cols = []
-    cat_cols = []
-    numeric_cols = []
+    if X.columns.duplicated().any():
+      # sklearn's ColumnTransformer rejects duplicate column names; fail fast
+      # here with an actionable message instead of crashing mid-pipeline.
+      raise ValueError(
+          "X contains duplicate column names:"
+          f" {X.columns[X.columns.duplicated()].unique().tolist()}. Rename or"
+          " deduplicate them before fitting, e.g. with"
+          " X.columns = range(X.shape[1])."
+      )
 
-    for col in X.columns:
-      series = X[col]
+    datetime_pos = []
+    cat_pos = []
+    numeric_pos = []
+
+    # Classify columns by position so column labels (which may be ints or
+    # other non-strings) are never used for lookups.
+    for pos in range(X.shape[1]):
+      series = X.iloc[:, pos]
       if pd.api.types.is_datetime64_any_dtype(series.dtype):
-        datetime_cols.append(col)
+        datetime_pos.append(pos)
       elif _looks_like_datetime(series):
-        datetime_cols.append(col)
+        datetime_pos.append(pos)
       elif pd.api.types.is_numeric_dtype(series.dtype):
-        numeric_cols.append(col)
+        numeric_pos.append(pos)
       else:
         # fallback to categorical if unknown
-        cat_cols.append(col)
-
-    cat_pos = [X.columns.get_loc(col) for col in cat_cols]
-    numeric_pos = [X.columns.get_loc(col) for col in numeric_cols]
-    datetime_pos = [X.columns.get_loc(col) for col in datetime_cols]
+        cat_pos.append(pos)
 
     self.tfm_ = ColumnTransformer(
         transformers=[
