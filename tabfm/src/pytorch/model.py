@@ -24,8 +24,9 @@ NOT yet wired to Orbax weights; see torch_parity_harness.py for the converter
 and parity gates.
 """
 
+import dataclasses
 import math
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -108,26 +109,54 @@ class MultiheadAttention(nn.Module):
     self.key_ln = RMSNorm(self.hd)
     self.per_dim_scale = nn.Parameter(torch.zeros(self.hd))
 
-  def forward(self, query, key, value, attn_mask=None, rope=None):
+  def forward(self, query, key, value, attn_mask=None, rope=None,
+              cached_kv=None, return_kv=False):
+    """Computes multi-head attention, optionally with a K/V cache.
+
+    At most one of cached_kv, return_kv is set. cached_kv is a (k, v) tuple of
+    already-projected (and, where used, rotated and key-normalized) tensors of
+    shape [B, T_src, N, D] from a prior call; key and value are then None and
+    their projections are skipped. return_kv returns the freshly computed
+    (k, v) in that layout for a later call to reuse.
+    """
     b, tq, d = query.shape
     q = self.q_proj(query).view(b, tq, self.nhead, self.hd)
-    k = self.k_proj(key).view(b, key.shape[1], self.nhead, self.hd)
-    v = self.v_proj(value).view(b, value.shape[1], self.nhead, self.hd)
+
+    if cached_kv is not None:
+      assert key is None and value is None, (
+          "key/value must be None when cached_kv is provided.")
+      cached_k, cached_v = cached_kv
+      # Cached K/V may be int8-quantized; dequantize to compute dtype before use.
+      k = cached_k.dequantize(q.dtype) if isinstance(cached_k, QuantizedTensor) else cached_k
+      v = cached_v.dequantize(q.dtype) if isinstance(cached_v, QuantizedTensor) else cached_v
+    else:
+      assert key is not None and value is not None, (
+          "key/value must not be None when cached_kv is absent.")
+      k = self.k_proj(key).view(b, key.shape[1], self.nhead, self.hd)
+      v = self.v_proj(value).view(b, value.shape[1], self.nhead, self.hd)
+
     if self.rope_base is not None:
-      # Use the Encoder's shared RoPE (checkpoint-loaded freqs) when provided;
-      # fall back to recomputing only if absent.
-      if rope is not None:
-        q, k = rope.rotate(q), rope.rotate(k)
-      else:
-        q, k = rope_interleaved(q, self.rope_base), rope_interleaved(k, self.rope_base)
-    q, k = self.query_ln(q), self.key_ln(k)
+      # Cached K is already post-RoPE, so only rotate freshly-computed K.
+      q = rope.rotate(q) if rope is not None else rope_interleaved(q, self.rope_base)
+      if cached_kv is None:
+        k = rope.rotate(k) if rope is not None else rope_interleaved(k, self.rope_base)
+
+    q = self.query_ln(q)
+    if cached_kv is None:
+      k = self.key_ln(k)
     # per-dim scale in float32 (softplus), then cast to compute dtype -- matches JAX PerDimScale.
     scale = 1.442695041 / math.sqrt(self.hd) * F.softplus(self.per_dim_scale.float())
     q = q * scale.to(q.dtype)
+
+    new_k, new_v = k, v  # cache format: [B, T_src, N, D], pre-transpose.
+
     q, k, v = (z.transpose(1, 2) for z in (q, k, v))  # [B,N,T,D]
     # bf16 SDPA (flash already does the softmax in float32 internally).
     o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=1.0)
-    return self.out_proj(o.transpose(1, 2).reshape(b, tq, d))
+    out = self.out_proj(o.transpose(1, 2).reshape(b, tq, d))
+    if return_kv:
+      return out, (new_k, new_v)
+    return out
 
 
 class MultiheadAttentionBlock(nn.Module):
@@ -169,13 +198,30 @@ class MultiheadAttentionBlock(nn.Module):
       out[s:s + self.ffn_chunk_size] = self._ff_impl(flat[s:s + self.ffn_chunk_size])
     return out.reshape(shape)
 
-  def forward(self, q, k=None, v=None, attn_mask=None, rope=None):
-    k = q if k is None else k
-    v = q if v is None else v
-    a = self.post_attn_ln(self.attn(self.pre_attn_ln(q), self.pre_attn_ln(k),
-                                    self.pre_attn_ln(v), attn_mask, rope=rope))
+  def forward(self, q, k=None, v=None, attn_mask=None, rope=None,
+              cached_kv=None, return_kv=False):
+    q_n = self.pre_attn_ln(q)
+    if cached_kv is not None:
+      assert k is None and v is None, (
+          "k/v must be None when cached_kv is provided.")
+      k_n, v_n = None, None
+    else:
+      k = q if k is None else k
+      v = q if v is None else v
+      k_n = self.pre_attn_ln(k)
+      v_n = self.pre_attn_ln(v)
+    attn_res = self.attn(q_n, k_n, v_n, attn_mask, rope=rope,
+                          cached_kv=cached_kv, return_kv=return_kv)
+    if return_kv:
+      attn_out, new_kv = attn_res
+    else:
+      attn_out = attn_res
+    a = self.post_attn_ln(attn_out)
     x = q + a
-    return x + self._ff(x)
+    x = x + self._ff(x)
+    if return_kv:
+      return x, new_kv
+    return x
 
 
 class InducedSelfAttentionBlock(nn.Module):
@@ -185,10 +231,22 @@ class InducedSelfAttentionBlock(nn.Module):
     self.mab1 = MultiheadAttentionBlock(d_model, nhead, dim_ff, activation)
     self.mab2 = MultiheadAttentionBlock(d_model, nhead, dim_ff, activation)
 
-  def forward(self, src, attn_mask=None):
-    ind = self.ind_vectors.unsqueeze(0).expand(src.shape[0], -1, -1)
-    hidden = self.mab1(ind, src, src, attn_mask=attn_mask)
-    return self.mab2(src, hidden, hidden)
+  def forward(self, src, attn_mask=None, cached_hidden=None, return_hidden=False):
+    """Applies induced self-attention, optionally reusing a cached hidden.
+
+    If cached_hidden (the mab1 output from a prior call) is given, mab1 is
+    skipped and only mab2 runs; return_hidden returns the freshly computed
+    hidden for a later call to reuse.
+    """
+    if cached_hidden is not None:
+      hidden = cached_hidden
+    else:
+      ind = self.ind_vectors.unsqueeze(0).expand(src.shape[0], -1, -1)
+      hidden = self.mab1(ind, src, src, attn_mask=attn_mask)
+    out = self.mab2(src, hidden, hidden)
+    if return_hidden:
+      return out, hidden
+    return out
 
 
 class Encoder(nn.Module):
@@ -202,7 +260,24 @@ class Encoder(nn.Module):
         for _ in range(num_blocks)
     ])
 
-  def forward(self, x, attn_mask=None):
+  def forward(self, x, attn_mask=None, cached_kv=None, return_kv=False):
+    """Runs the stacked attention blocks, optionally with a per-block K/V cache.
+
+    cached_kv, if given, is a per-block list of (k, v) that each block uses in
+    place of its k/v projections; return_kv collects the freshly computed
+    per-block (k, v). At most one of the two is set.
+    """
+    if cached_kv is not None:
+      assert not return_kv, "Cannot both use cached_kv and return_kv."
+      for blk, kv in zip(self.blocks, cached_kv):
+        x = blk(x, attn_mask=attn_mask, rope=self.rope, cached_kv=kv)
+      return x
+    if return_kv:
+      kvs = []
+      for blk in self.blocks:
+        x, kv = blk(x, attn_mask=attn_mask, rope=self.rope, return_kv=True)
+        kvs.append(kv)
+      return x, kvs
     for blk in self.blocks:
       x = blk(x, attn_mask=attn_mask, rope=self.rope)
     return x
@@ -217,7 +292,24 @@ class SetTransformer(nn.Module):
         for _ in range(num_blocks)
     ])
 
-  def forward(self, src, attn_mask=None):
+  def forward(self, src, attn_mask=None, cached_hidden=None, return_hidden=False):
+    """Runs the stacked induced-attention blocks.
+
+    cached_hidden, if given, is a per-block list of cached mab1 outputs (see
+    InducedSelfAttentionBlock.forward()); return_hidden=True collects the
+    freshly computed per-block hidden reprs for later reuse.
+    """
+    if cached_hidden is not None:
+      assert not return_hidden, "Cannot both use cached_hidden and return_hidden."
+      for blk, h in zip(self.blocks, cached_hidden):
+        src = blk(src, cached_hidden=h)
+      return src
+    if return_hidden:
+      hiddens = []
+      for blk in self.blocks:
+        src, h = blk(src, attn_mask=attn_mask, return_hidden=True)
+        hiddens.append(h)
+      return src, hiddens
     for blk in self.blocks:
       src = blk(src, attn_mask=attn_mask)
     return src
@@ -344,15 +436,61 @@ class ColEmbedding(nn.Module):
     self.ln_w = RMSNorm(d_model)
     self.col_chunk_size = None  # chunk the independent column axis (B*HC)
 
-  def _stage(self, src, mask):
-    return self.ln_w(self.out_w(self.tf_col(src, attn_mask=mask)))
+  def _stage(self, src, mask=None, cached_hidden=None, return_hidden=False):
+    out = self.tf_col(src, attn_mask=mask, cached_hidden=cached_hidden,
+                       return_hidden=return_hidden)
+    if return_hidden:
+      out, hidden = out
+      return self.ln_w(self.out_w(out)), hidden
+    return self.ln_w(self.out_w(out))
 
-  def forward(self, x, train_size):  # x: [B,T,HC,E]
+  def forward(self, x, train_size, *, cached_repr=None, return_repr=False):
+    """Transform input table into column-wise embeddings.
+
+    train_size is None exactly when cached_repr is given (decode): cached_repr
+    supplies the induced-point hidden, so mab1 and its mask are skipped.
+    cached_repr and return_repr are mutually exclusive.
+    """
+    assert not (cached_repr is not None and return_repr), (
+        "Cannot have both cached_repr not None and return_repr True.")
+    assert (cached_repr is not None) == (train_size is None), (
+        "train_size must be None iff cached_repr is given.")
     b, t, hc, e = x.shape
     src = x.permute(0, 2, 1, 3).reshape(b * hc, t, e)  # [B*HC, T, E]
+    cc = self.col_chunk_size
+
+    if cached_repr is not None:  # Decode: reuse cached induced-point hidden.
+      if cc is None or src.shape[0] <= cc:
+        out = self._stage(src, None, cached_hidden=cached_repr)
+      else:
+        parts = []
+        for s in range(0, src.shape[0], cc):
+          chunk_repr = [h[s:s + cc] for h in cached_repr]
+          parts.append(self._stage(src[s:s + cc], None, cached_hidden=chunk_repr))
+        out = torch.cat(parts, dim=0)
+      return out.reshape(b, hc, t, e).permute(0, 2, 1, 3)
+
     ts = train_size.repeat_interleave(hc)  # [B*HC]
     mask = (torch.arange(t, device=x.device)[None, :] < ts[:, None])[:, None, None, :]
-    cc = self.col_chunk_size
+
+    if return_repr:  # Prefill: also return the induced-point hidden per block.
+      if cc is None or src.shape[0] <= cc:
+        out, hidden = self._stage(src, mask, return_hidden=True)
+      else:
+        out_parts = []
+        hidden_parts = None
+        for s in range(0, src.shape[0], cc):
+          o, h = self._stage(src[s:s + cc], mask[s:s + cc], return_hidden=True)
+          out_parts.append(o)
+          if hidden_parts is None:
+            hidden_parts = [[] for _ in h]
+          for i, hh in enumerate(h):
+            hidden_parts[i].append(hh)
+        out = torch.cat(out_parts, dim=0)
+        hidden = [torch.cat(parts, dim=0) for parts in hidden_parts]
+      out = out.reshape(b, hc, t, e).permute(0, 2, 1, 3)
+      return out, hidden
+
     if cc is None or src.shape[0] <= cc:
       out = self._stage(src, mask)
     else:
@@ -397,6 +535,99 @@ class RowInteraction(nn.Module):
     return out.reshape(b, t, -1)
 
 
+@dataclasses.dataclass
+class QuantizedTensor:
+  """Per-tensor symmetric integer quantization of a cached K or V tensor.
+
+  data holds the quantized codes; scale is the per-tensor absmax / max_val
+  factor, so the float value is data.to(dtype) * scale.
+  """
+  data: torch.Tensor
+  scale: torch.Tensor
+
+  def dequantize(self, dtype: torch.dtype) -> torch.Tensor:
+    """Dequantizes back to a floating-point tensor of the given dtype."""
+    return self.data.to(dtype) * self.scale.to(dtype)
+
+
+# Per dtype: (lo, hi, max_val) clamp range, one code below the dtype's full
+# range so -max and +max map symmetrically and dequantization cannot exceed
+# the original absmax in magnitude.
+_QUANTIZATION_RANGES: Dict[torch.dtype, Tuple[int, int, int]] = {
+    torch.int8: (-127, 127, 127),
+}
+
+
+def _quantize_tensor(t: torch.Tensor,
+                      dtype: torch.dtype = torch.int8) -> QuantizedTensor:
+  """Per-tensor symmetric integer quantization to dtype."""
+  if dtype not in _QUANTIZATION_RANGES:
+    raise ValueError(f"Unsupported quantization dtype {dtype}; supported: "
+                      f"{list(_QUANTIZATION_RANGES.keys())}")
+  lo, hi, max_val = _QUANTIZATION_RANGES[dtype]
+  absmax = t.abs().amax()
+  scale = absmax / max_val
+  # Avoid division by zero for all-zero tensors.
+  scale = torch.clamp(scale, min=torch.finfo(scale.dtype).tiny)
+  data = (t / scale).round().clamp(lo, hi).to(dtype)
+  return QuantizedTensor(data=data, scale=scale)
+
+
+def move_cache_to_device(cache, device):
+  """Recursively moves a TabFM.prefill() cache dict to device.
+
+  Handles the nested structure of the cache returned by TabFM.prefill(): a
+  dict (top-level col1/col2/icl keys), a list/tuple (per-block K/V pairs,
+  per-block induced-point hidden reprs), the ICLearningCache/QuantizedTensor
+  dataclasses, and plain tensor leaves. Needed for the
+  keep_cache_on_device=False path (CPU-offload between predict calls).
+  """
+  if isinstance(cache, torch.Tensor):
+    return cache.to(device)
+  if isinstance(cache, dict):
+    return {k: move_cache_to_device(v, device) for k, v in cache.items()}
+  if isinstance(cache, list):
+    return [move_cache_to_device(v, device) for v in cache]
+  if isinstance(cache, tuple):
+    return tuple(move_cache_to_device(v, device) for v in cache)
+  if dataclasses.is_dataclass(cache):
+    kwargs = {f.name: move_cache_to_device(getattr(cache, f.name), device)
+              for f in dataclasses.fields(cache)}
+    return type(cache)(**kwargs)
+  return cache
+
+
+@dataclasses.dataclass
+class ICLearningCache:
+  """Per-block ICL K/V cache produced at prefill and reused at decode.
+
+  layer_caches is a per-block list of (k, v) of shape [B, T_prefill, N, D],
+  each a QuantizedTensor after quantize(). prefill_train_size is the [B] count
+  of valid training rows used to build the decode attention mask; it stays
+  full precision after quantize().
+  """
+  layer_caches: List[Tuple[Any, Any]]
+  prefill_train_size: torch.Tensor
+
+  @property
+  def prefill_seq_len(self) -> int:
+    """Sequence length of the prefill cache, derived from tensor shape."""
+    k, _ = self.layer_caches[0]
+    data = k.data if isinstance(k, QuantizedTensor) else k
+    return data.shape[1]
+
+  def quantize(self, dtype: torch.dtype = torch.int8) -> "ICLearningCache":
+    """Returns a copy with the per-block ICL K/V quantized to dtype.
+
+    Only the attention K/V is quantized; prefill_train_size stays full
+    precision.
+    """
+    quantized = [(_quantize_tensor(k, dtype), _quantize_tensor(v, dtype))
+                 for k, v in self.layer_caches]
+    return ICLearningCache(layer_caches=quantized,
+                            prefill_train_size=self.prefill_train_size)
+
+
 class ICLearning(nn.Module):
   def __init__(self, d_model, num_blocks, nhead, max_classes, dim_ff,
                decoder_hidden, is_classifier=True):
@@ -411,8 +642,28 @@ class ICLearning(nn.Module):
       self.y_encoder = MLP(1, [decoder_hidden], d_model)
       self.decoder = MLP(d_model, [decoder_hidden], 1)
 
-  def forward(self, reps, y, train_size):  # reps: [B,T,d_model]
+  def forward(self, reps, y, train_size, *,
+              cache: Optional[ICLearningCache] = None,
+              return_cache: bool = False):
+    """Forward pass for ICLearning. reps: [B, T, E] row representations.
+
+    train_size is None exactly when cache is given (decode): the attention mask
+    is then derived from the cached prefill's train size and sequence length
+    rather than this call's, and y is unused. return_cache (prefill only) also
+    returns the ICLearningCache for this call alongside the decoded output.
+    """
+    assert (cache is not None) == (train_size is None), (
+        "train_size must be None iff cache is given.")
     b, t, _ = reps.shape
+
+    if cache is not None:  # Decode.
+      prefill_seq_len = cache.prefill_seq_len
+      tm_ctx = (torch.arange(prefill_seq_len, device=reps.device)[None, :]
+                < cache.prefill_train_size[:, None])
+      mask = tm_ctx[:, None, None, :]
+      out = self.tf_icl(reps, attn_mask=mask, cached_kv=cache.layer_caches)
+      return self.decoder(self.ln(out))
+
     tm = (torch.arange(t, device=reps.device)[None, :] < train_size[:, None])
     if self.is_classifier:
       y_enc = self.y_encoder(y)
@@ -420,6 +671,10 @@ class ICLearning(nn.Module):
       y_enc = self.y_encoder(y[..., None].to(reps.dtype))
     r = reps + y_enc * tm[..., None]
     mask = tm[:, None, None, :]
+    if return_cache:  # Prefill.
+      out, kvs = self.tf_icl(r, attn_mask=mask, return_kv=True)
+      new_cache = ICLearningCache(layer_caches=kvs, prefill_train_size=train_size)
+      return self.decoder(self.ln(out)), new_cache
     out = self.tf_icl(r, attn_mask=mask)
     return self.decoder(self.ln(out))
 
@@ -485,3 +740,78 @@ class TabFM(nn.Module):
     emb = self.col_embedder_2(emb, train_size)
     reps = self.row_interactor_2(emb, d=d)
     return self.icl_predictor(reps, y, train_size)
+
+  def prefill(self, x, y, cat_mask=None, d=None):
+    """Encodes context (training) rows once and returns (logits, cache).
+
+    x is [B, T, H] context rows and y is [B, T] context labels; cat_mask is an
+    optional [B, H] categorical-feature mask and d an optional [B] active-
+    feature count. Pads the sequence to a multiple of 128 with the -100
+    sentinel, derives train_size from the non-sentinel y entries, runs the full
+    pipeline while collecting the col-embedder induced-point reprs and the ICL
+    encoder per-layer K/V, and unpads the logits to the original length. cache
+    is a dict with keys 'col1', 'col2' (per-block induced-point reprs) and
+    'icl' (an ICLearningCache).
+    """
+    x = torch.nan_to_num(x, nan=-100.0).to(self.cls_tokens.dtype)
+    y = y.to(self.cls_tokens.dtype)
+
+    t_orig = x.shape[1]
+    block_size = 128
+    pad_len = ((t_orig - 1) // block_size + 1) * block_size - t_orig
+    if pad_len > 0:
+      x = F.pad(x, (0, 0, 0, pad_len), value=-100.0)
+      y = F.pad(y, (0, pad_len), value=-100.0)
+
+    # All data is training data; train_size counts non-sentinel y entries so
+    # externally-padded rows (or the padding just added above) are excluded.
+    is_valid = y != -100.0
+    train_size = is_valid.sum(dim=-1).to(torch.long)
+
+    cell = self.cell_embedder(x, y, train_size, cat_mask, d=d)
+    emb, cache_col1 = self.col_embedder(cell, train_size, return_repr=True)
+    b1, t1, _, e = emb.shape
+    cls = self.cls_tokens.expand(b1, t1, -1, -1)
+    emb = torch.cat([cls, emb], dim=2)
+    emb = self.row_interactor(emb, d=d)
+    emb, cache_col2 = self.col_embedder_2(emb, train_size, return_repr=True)
+    reps = self.row_interactor_2(emb, d=d)
+    logits, cache_icl = self.icl_predictor(reps, y, train_size, return_cache=True)
+
+    cache = {"col1": cache_col1, "col2": cache_col2, "icl": cache_icl}
+    return logits[:, :t_orig, :], cache
+
+  def decode(self, x, cache, cat_mask=None, d=None):
+    """Generates predictions for test rows using a cache from prefill.
+
+    x is [B, T, H] test rows and cache is the dict returned by prefill;
+    cat_mask and d are as in prefill. Pads to a multiple of 128, re-runs the
+    row-independent cell embedder and row interactors on the test rows, reuses
+    the cached col-embedder reprs and ICL per-layer K/V instead of recomputing
+    them from the context, and unpads to the original test length. Returns
+    [B, T, K_or_1] logits.
+    """
+    x = torch.nan_to_num(x, nan=-100.0).to(self.cls_tokens.dtype)
+    b, t_orig, _ = x.shape
+
+    block_size = 128
+    pad_len = ((t_orig - 1) // block_size + 1) * block_size - t_orig
+    if pad_len > 0:
+      x = F.pad(x, (0, 0, 0, pad_len), value=-100.0)
+
+    # y carries no information for test rows in decode (unlabeled); use the
+    # -100 sentinel throughout, matching JAX.
+    y = torch.full((b, x.shape[1]), -100.0, dtype=self.cls_tokens.dtype, device=x.device)
+    train_size_zero = torch.zeros(b, dtype=torch.long, device=x.device)
+
+    cell = self.cell_embedder(x, y, train_size_zero, cat_mask, d=d)
+    emb = self.col_embedder(cell, None, cached_repr=cache["col1"])
+    b1, t1, _, e = emb.shape
+    cls = self.cls_tokens.expand(b1, t1, -1, -1)
+    emb = torch.cat([cls, emb], dim=2)
+    emb = self.row_interactor(emb, d=d)
+    emb = self.col_embedder_2(emb, None, cached_repr=cache["col2"])
+    reps = self.row_interactor_2(emb, d=d)
+    out = self.icl_predictor(reps, y, None, cache=cache["icl"])
+
+    return out[:, :t_orig, :]

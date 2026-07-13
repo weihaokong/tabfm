@@ -66,6 +66,24 @@ class PyTorchClassifierRegressorTest(unittest.TestCase):
     self.assertEqual(probs.shape, (10, 3))
     np.testing.assert_allclose(np.sum(probs, axis=1), 1.0, rtol=1e-5)
 
+    # cache_context=True should be a pure speedup: predict_proba should match
+    # the uncached path exactly. maybe_quantize_kv_cache=False isolates this
+    # from the (lossy by design) int8 KV-cache quantization, which is tested
+    # separately in model_test.py.
+    cached_clf = TabFMClassifier(
+        model=model,
+        n_estimators=2,
+        batch_size=2,
+        random_state=42,
+        cache_context=True,
+        maybe_quantize_kv_cache=False,
+    )
+    cached_clf.fit(X, y)
+    probs_cached = cached_clf.predict_proba(X)
+    self.assertEqual(probs_cached.shape, (10, 3))
+    np.testing.assert_allclose(np.sum(probs_cached, axis=1), 1.0, rtol=1e-5)
+    np.testing.assert_allclose(probs_cached, probs, rtol=1e-5, atol=1e-6)
+
   def test_regressor_fit_predict(self):
     np.random.seed(42)
     # Instantiate small PyTorch model
@@ -96,10 +114,27 @@ class PyTorchClassifierRegressorTest(unittest.TestCase):
     y = np.random.rand(10)
 
     reg.fit(X, y)
-    
+
     # Predict
     preds = reg.predict(X)
     self.assertEqual(preds.shape, (10,))
+
+    # cache_context=True should be a pure speedup: predict should match the
+    # uncached path exactly. maybe_quantize_kv_cache=False isolates this from
+    # the (lossy by design) int8 KV-cache quantization, which is tested
+    # separately in model_test.py.
+    cached_reg = TabFMRegressor(
+        model=model,
+        n_estimators=2,
+        batch_size=2,
+        random_state=42,
+        cache_context=True,
+        maybe_quantize_kv_cache=False,
+    )
+    cached_reg.fit(X, y)
+    preds_cached = cached_reg.predict(X)
+    self.assertEqual(preds_cached.shape, (10,))
+    np.testing.assert_allclose(preds_cached, preds, rtol=1e-5, atol=1e-6)
 
 
 class PyTorchModelPickleTest(unittest.TestCase):

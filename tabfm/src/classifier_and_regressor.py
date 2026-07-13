@@ -49,6 +49,7 @@ except ImportError:
 
 try:
   import torch
+  from tabfm.src.pytorch.model import move_cache_to_device
   HAS_TORCH = True
 except ImportError:
   HAS_TORCH = False
@@ -1685,6 +1686,184 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     ds_all = np.array(ds_all, dtype=np.int32)
     return Xs_all, ys_all, cat_masks_all, ds_all, configs_flat
 
+  def prepare_test_tensors(
+      self, data: collections.OrderedDict
+  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Any]]:
+    """Like prepare_ensemble_tensors(), but for test-only data (no labels).
+
+    Used by the cache_context=True decode path (see transform_test_only()),
+    where data maps norm_method -> (Xs, None) instead of (Xs, ys).
+
+    Args:
+      data: Ordered dictionary mapping normalization string keys to Xs
+        tensors (e.g., returned by transform_test_only()).
+
+    Returns:
+      Tuple containing:
+        - Xs_all: Concatenated feature array across all ensemble configs.
+        - cat_masks_all: Stacked boolean masks indicating categorical indices.
+        - ds_all: Array indicating sequence lengths per config.
+        - configs_flat: Flattened list of ensemble config tuples.
+    """
+    max_features = max(Xs.shape[-1] for _, (Xs, _) in data.items())
+    Xs_all, cat_masks_all, ds_all = [], [], []
+    configs_flat = []
+
+    for norm_method, (Xs, _) in data.items():
+      Xs_all.append(Xs)
+      configs = self.ensemble_configs_[norm_method]
+      for config in configs:
+        configs_flat.append(config)
+        shuffle_pattern, _, _, _ = config
+        mask = np.zeros(self.n_features_in_, dtype=np.bool_)
+        if hasattr(self, "cat_features_"):
+          mask[self.cat_features_] = True
+        ds_all.append(len(shuffle_pattern))
+        cat_mask = _pad_cat_mask(mask[shuffle_pattern], max_features)
+        cat_masks_all.append(cat_mask)
+
+    Xs_all = np.concatenate(Xs_all, axis=0)
+    cat_masks_all = np.stack(cat_masks_all, axis=0)
+    ds_all = np.array(ds_all, dtype=np.int32)
+    return Xs_all, cat_masks_all, ds_all, configs_flat
+
+  def transform_context_only(self) -> collections.OrderedDict:
+    """Builds per-member context-only (training-row) feature/label tensors.
+
+    Used to build a cache_context=True prefill cache at fit() time. This
+    mirrors exactly the "training rows" half of what _transform_features()
+    computes for the concatenated train+test tensor (same preprocessing,
+    same categorical-permutation handling, same shuffle pattern and
+    class-shift offset per config) but omits ever concatenating test rows.
+
+    This is correct because every preprocessor.transform() step, including
+    _apply_categorical_permutation(), is row-independent: each output row is
+    computed from that row's values and fit-time statistics, not from other
+    rows in the batch.
+
+    Returns:
+      OrderedDict mapping each norm_method to a tuple (Xs, ys) with the
+      same shapes/semantics as transform()'s "training" portion.
+    """
+    check_is_fitted(self, ["ensemble_configs_"])
+    y = self.y_
+    N = len(y)
+
+    max_features = 0
+    for (
+        norm_method,
+        shuffle_shift_cat_configs,
+    ) in self.ensemble_configs_.items():
+      for shuffle_pattern, _, _, _ in shuffle_shift_cat_configs:
+        max_features = max(max_features, len(shuffle_pattern))
+
+    data: collections.OrderedDict = collections.OrderedDict()
+    for (
+        norm_method,
+        shuffle_shift_cat_configs,
+    ) in self.ensemble_configs_.items():
+      preprocessor = self.preprocessors_[norm_method]
+      X_ensemble = []
+      y_ensemble = []
+
+      for (
+          shuffle_pattern,
+          shift_offset,
+          cat_perm,
+          row_sub_pattern,
+      ) in shuffle_shift_cat_configs:
+        in_bag_idx = (
+            row_sub_pattern if row_sub_pattern is not None else np.arange(N)
+        )
+        train_idx = in_bag_idx
+        y_to_use = y[train_idx]
+
+        if cat_perm:
+          X_train_to_use = self.X_[train_idx].copy()
+          _apply_categorical_permutation(X_train_to_use, cat_perm)
+          X_variant_instance = preprocessor.transform(X_train_to_use)
+        else:
+          X_variant_instance = preprocessor.X_transformed_[train_idx]
+
+        shuffled_cols = X_variant_instance[:, shuffle_pattern]
+        shuffled_cols = _pad_features(shuffled_cols, max_features)
+        X_ensemble.append(shuffled_cols)
+
+        if self.task == "classification":
+          y_ensemble.append((y_to_use + shift_offset) % self.n_classes_)
+        else:
+          y_ensemble.append(y_to_use)
+
+      data[norm_method] = (
+          np.stack(X_ensemble, axis=0),
+          np.stack(y_ensemble, axis=0),
+      )
+
+    return data
+
+  def transform_test_only(self, X: Any) -> collections.OrderedDict:
+    """Builds per-member test-only feature tensors (no context rows).
+
+    Used for the cache_context=True decode path at predict_proba() time.
+    Mirrors exactly the "test rows" half of what _transform_features()
+    computes for the concatenated train+test tensor (see
+    transform_context_only() for why omitting the concatenation is safe).
+
+    Args:
+      X: Array-like of shape (n_test_samples, n_features).
+
+    Returns:
+      OrderedDict mapping each norm_method to a tuple (Xs, None) where
+      Xs has shape (n_configs, n_test, n_features).
+    """
+    check_is_fitted(self, ["ensemble_configs_"])
+    X = self.unique_filter_.transform(X)
+
+    if hasattr(self, "cross_pairs_") and self.cross_pairs_:
+      X = _append_cross_features(X, self.cross_pairs_)
+
+    if hasattr(self, "svd_pipeline_") and self.svd_pipeline_:
+      X = _append_svd_features(
+          X, self.n_original_features_, self.svd_pipeline_, is_train=False
+      )
+
+    max_features = 0
+    for (
+        norm_method,
+        shuffle_shift_cat_configs,
+    ) in self.ensemble_configs_.items():
+      for shuffle_pattern, _, _, _ in shuffle_shift_cat_configs:
+        max_features = max(max_features, len(shuffle_pattern))
+
+    data: collections.OrderedDict = collections.OrderedDict()
+    for (
+        norm_method,
+        shuffle_shift_cat_configs,
+    ) in self.ensemble_configs_.items():
+      preprocessor = self.preprocessors_[norm_method]
+      X_ensemble = []
+
+      for (
+          shuffle_pattern,
+          _,
+          cat_perm,
+          _,
+      ) in shuffle_shift_cat_configs:
+        if cat_perm:
+          X_test_to_use = X.copy()
+          _apply_categorical_permutation(X_test_to_use, cat_perm)
+          X_variant_instance = preprocessor.transform(X_test_to_use)
+        else:
+          X_variant_instance = preprocessor.transform(X)
+
+        shuffled_cols = X_variant_instance[:, shuffle_pattern]
+        shuffled_cols = _pad_features(shuffled_cols, max_features)
+        X_ensemble.append(shuffled_cols)
+
+      data[norm_method] = (np.stack(X_ensemble, axis=0), None)
+
+    return data
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -1826,8 +2005,168 @@ def _predict_step_pytorch(
   return out_t.float().cpu().numpy()  # upcast: numpy has no bfloat16
 
 
+def _build_context_cache_pytorch(
+    model: Any,
+    ensemble_generator: "EnsembleGenerator",
+    batch_size: Optional[int],
+    maybe_quantize_kv_cache: bool = True,
+    keep_cache_on_device: bool = True,
+) -> Tuple[List[Any], int]:
+  """Prefills each ensemble member's in-context (training) rows once.
+
+  Shared by TabFMClassifier._build_context_cache() and
+  TabFMRegressor._build_context_cache() (cache_context=True). Runs
+  model.prefill() once per ensemble member, batched the same way
+  _batch_forward() batches the uncached forward pass (via batch_size).
+
+  Args:
+    model: PyTorch TabFM nn.Module.
+    ensemble_generator: Fitted EnsembleGenerator.
+    batch_size: Number of ensemble members per model.prefill() call (None
+      or 0 means all at once).
+    maybe_quantize_kv_cache: If True (default) and the cache supports it
+      (ICLearningCache.quantize()), int8-quantize the ICL K/V right after
+      prefill to reduce the resident memory of holding every ensemble
+      member's cache on-device at once.
+    keep_cache_on_device: If True (default), keep each cache on the model's
+      device. If False, move it to CPU right after building (traded for
+      lower steady-state device memory at the cost of a transfer on every
+      predict call; see _decode_context_cache_pytorch()).
+
+  Returns:
+    Tuple of (caches, n_members): caches is the list of per-batch cache
+    dicts returned by model.prefill(), and n_members is the total number
+    of ensemble members (used later to detect a stale cache).
+  """
+  data_ctx = ensemble_generator.transform_context_only()
+  Xs_ctx, ys_ctx, cat_masks_ctx, ds_ctx, _ = (
+      ensemble_generator.prepare_ensemble_tensors(data_ctx)
+  )
+
+  n_members = Xs_ctx.shape[0]
+  batch_size_per_process = batch_size or n_members
+  n_batches = math.ceil(n_members / batch_size_per_process)
+  if n_batches > 1:
+    Xs_split = np.array_split(Xs_ctx, n_batches)
+    ys_split = np.array_split(ys_ctx, n_batches)
+    cat_masks_split = np.array_split(cat_masks_ctx, n_batches)
+    ds_split = np.array_split(ds_ctx, n_batches)
+  else:
+    Xs_split = [Xs_ctx]
+    ys_split = [ys_ctx]
+    cat_masks_split = [cat_masks_ctx]
+    ds_split = [ds_ctx]
+
+  device = next(model.parameters()).device
+  caches = []
+  with torch.no_grad():
+    for X_batch, y_batch, cat_mask_batch, ds_batch in zip(
+        Xs_split, ys_split, cat_masks_split, ds_split
+    ):
+      X_t = torch.from_numpy(X_batch).to(device, dtype=torch.float32)
+      y_t = torch.from_numpy(y_batch).to(device)
+      if y_t.dtype == torch.float64:
+        y_t = y_t.to(torch.float32)
+      cat_mask_t = torch.from_numpy(cat_mask_batch).to(device)
+      d_t = torch.from_numpy(ds_batch).to(device)
+      _, cache = model.prefill(X_t, y_t, cat_mask=cat_mask_t, d=d_t)
+      icl_cache = cache.get("icl")
+      if maybe_quantize_kv_cache and hasattr(icl_cache, "quantize"):
+        cache["icl"] = icl_cache.quantize()
+      if not keep_cache_on_device:
+        cache = move_cache_to_device(cache, "cpu")
+      caches.append(cache)
+
+  return caches, n_members
+
+
+def _decode_context_cache_pytorch(
+    model: Any,
+    ensemble_generator: "EnsembleGenerator",
+    X_transformed: np.ndarray,
+    context_caches: List[Any],
+    expected_n_members: int,
+    batch_size: Optional[int],
+    keep_cache_on_device: bool = True,
+) -> np.ndarray:
+  """Decodes test rows against a context cache from _build_context_cache_pytorch().
+
+  Shared by TabFMClassifier._predict_proba_internal_cached() and
+  TabFMRegressor._predict_internal_cached(). Builds test-only feature
+  tensors (via transform_test_only(), which does not concatenate the
+  training context) and calls model.decode() per ensemble-member batch
+  against its cached context, using the same batching as
+  _build_context_cache_pytorch()/_batch_forward(). model.decode() dequantizes
+  any int8-quantized K/V internally (see MultiheadAttention.forward()).
+
+  Args:
+    model: PyTorch TabFM nn.Module.
+    ensemble_generator: Fitted EnsembleGenerator.
+    X_transformed: Already-X_encoder_-transformed test features.
+    context_caches: List of per-batch cache dicts from
+      _build_context_cache_pytorch().
+    expected_n_members: Total ensemble member count recorded at fit() time.
+    batch_size: Number of ensemble members per model.decode() call.
+    keep_cache_on_device: If False, each batch's cache was moved to CPU by
+      _build_context_cache_pytorch(); move it back to the model's device for
+      this call.
+
+  Returns:
+    np.ndarray of shape (n_members, n_test, output_dim).
+
+  Raises:
+    RuntimeError: If the ensemble member count changed since fit(), or the
+      batch grouping does not match the cached batches.
+  """
+  data_test = ensemble_generator.transform_test_only(X_transformed)
+  Xs_test, cat_masks_test, ds_test, _ = (
+      ensemble_generator.prepare_test_tensors(data_test)
+  )
+
+  n_members = Xs_test.shape[0]
+  if n_members != expected_n_members:
+    raise RuntimeError(
+        f"Number of ensemble members changed between fit() ({expected_n_members})"
+        f" and predict() ({n_members}); the context cache is stale."
+    )
+
+  batch_size_per_process = batch_size or n_members
+  n_batches = math.ceil(n_members / batch_size_per_process)
+  if n_batches > 1:
+    Xs_split = np.array_split(Xs_test, n_batches)
+    cat_masks_split = np.array_split(cat_masks_test, n_batches)
+    ds_split = np.array_split(ds_test, n_batches)
+  else:
+    Xs_split = [Xs_test]
+    cat_masks_split = [cat_masks_test]
+    ds_split = [ds_test]
+
+  if len(Xs_split) != len(context_caches):
+    raise RuntimeError(
+        "Batch grouping mismatch between fit()-time context cache"
+        f" ({len(context_caches)} groups) and predict()"
+        f" ({len(Xs_split)} groups); this should not happen because both"
+        " use the same total member count and batch_size."
+    )
+
+  device = next(model.parameters()).device
+  outputs = []
+  with torch.no_grad():
+    for X_batch, cat_mask_batch, ds_batch, cache in zip(
+        Xs_split, cat_masks_split, ds_split, context_caches
+    ):
+      X_t = torch.from_numpy(X_batch).to(device, dtype=torch.float32)
+      cat_mask_t = torch.from_numpy(cat_mask_batch).to(device)
+      d_t = torch.from_numpy(ds_batch).to(device)
+      if not keep_cache_on_device:
+        cache = move_cache_to_device(cache, device)
+      out_t = model.decode(X_t, cache, cat_mask=cat_mask_t, d=d_t)
+      outputs.append(out_t.float().cpu().numpy())
+  return np.concatenate(outputs, axis=0)
+
+
 # Compiled predict step functions memoized on the estimators by
-# _batch_forward. They close over nnx.jit state and cannot be pickled.
+# _batch_forward(). They close over nnx.jit state and cannot be pickled.
 _COMPILED_PREDICT_CACHE_ATTRS = (
     "_predict_step_compiled_with_cat",
     "_predict_step_compiled_no_cat",
@@ -1939,6 +2278,9 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       nnls_beta: float = 0.75,
       calibration_lambda: float = 1e-2,
       min_rows_for_single_val_split: int = 2000,
+      cache_context: bool = False,
+      maybe_quantize_kv_cache: bool = True,
+      keep_cache_on_device: bool = True,
   ):
     """Initialises the classifier.
 
@@ -1982,6 +2324,25 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       min_rows_for_single_val_split: Minimum validation rows required to allow
         learning ensemble/calibration weights on a single train/val split
         instead of full CV. 0 means always doing full CV.
+      cache_context: If True, encode the in-context (training) rows once per
+        ensemble member at fit() time and reuse that cache (per-layer K/V
+        and column-embedder induced-point reprs) on every predict_proba()
+        call, instead of re-encoding the full context on every call.
+        With maybe_quantize_kv_cache=False, the cached path is a pure speedup:
+        results are numerically identical (within floating point) to
+        cache_context=False. Only supported on the PyTorch backend; raises
+        NotImplementedError for JAX models.
+      maybe_quantize_kv_cache: If True (default) and cache_context=True,
+        int8-quantize each ensemble member's cached ICL K/V right after
+        fit() builds it (per-tensor symmetric quantization). This lets every
+        member's cache stay resident on the GPU at once without exhausting
+        device memory; it introduces small int8 rounding error, typically
+        negligible for reported metrics. Ignored when cache_context=False.
+      keep_cache_on_device: If True (default), keep every ensemble member's
+        context cache on the model's device between predict_proba() calls. If
+        False, caches are moved to CPU after fit() and transferred back to the
+        device on every predict_proba() call, trading latency for lower
+        steady-state device memory. Ignored when cache_context=False.
     """
     self.model = model
     self.n_estimators = n_estimators
@@ -2009,6 +2370,9 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     self.nnls_beta = nnls_beta
     self.calibration_lambda = calibration_lambda
     self.min_rows_for_single_val_split = min_rows_for_single_val_split
+    self.cache_context = cache_context
+    self.maybe_quantize_kv_cache = maybe_quantize_kv_cache
+    self.keep_cache_on_device = keep_cache_on_device
     if self.average_logits and self.enable_nnls:
       raise ValueError("average_logits and enable_nnls cannot both be True.")
     if self.max_num_rows is not None and self.enable_nnls:
@@ -2135,6 +2499,9 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     )
     self.ensemble_generator_.fit(X, y)
 
+    if self.cache_context:
+      self._build_context_cache()
+
     oof_probs_fit = None
     if self.enable_nnls or (
         self.active_calibration_method_ is not None
@@ -2192,6 +2559,85 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       self._fit_calibration(P, y_fit)
 
     return self
+
+  def _build_context_cache(self) -> None:
+    """Prefills and caches each ensemble member's in-context (training) rows.
+
+    Called from fit() when cache_context=True. Runs model.prefill()
+    once per ensemble member (batched the same way _batch_forward() batches
+    the uncached forward pass, via self.batch_size) and stores the
+    resulting caches on self.context_caches_, alongside the per-member
+    categorical masks / active-feature counts needed to later decode test
+    rows against those caches (see _predict_proba_internal_cached()).
+
+    Only supported on the PyTorch backend: the JAX backend's prefill()/
+    decode() are not wired up here (this classifier's caching path assumes
+    the PyTorch TabFM.prefill()/decode() cache/tensor contracts).
+
+    Raises:
+      NotImplementedError: If self.model is not a PyTorch nn.Module.
+    """
+    is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
+    if not is_torch:
+      raise NotImplementedError(
+          "cache_context=True is only implemented for the PyTorch TabFM"
+          " backend; the JAX backend's prefill()/decode() are not wired up"
+          " here yet."
+      )
+
+    self.context_caches_, self._context_n_members_ = (
+        _build_context_cache_pytorch(
+            self.model, self.ensemble_generator_, self.batch_size,
+            maybe_quantize_kv_cache=self.maybe_quantize_kv_cache,
+            keep_cache_on_device=self.keep_cache_on_device,
+        )
+    )
+
+  def _predict_proba_internal_cached(
+      self, X_transformed: np.ndarray
+  ) -> np.ndarray:
+    """cache_context=True counterpart of _predict_proba_internal().
+
+    Builds test-only feature tensors (via transform_test_only(), which does
+    not concatenate the training context) and decodes each ensemble member's
+    test chunk against its cached context, built once by
+    _build_context_cache() at fit() time. It reuses the same batching,
+    class-shift correction, and output-dim checks as the uncached path.
+
+    Args:
+      X_transformed: Already-X_encoder_-transformed test features.
+
+    Returns:
+      Array of shape (n_estimators_total, n_test_samples, n_classes) of raw
+      (class-shift-corrected) logits, matching _predict_proba_internal()'s
+      return contract.
+    """
+    if not hasattr(self, "context_caches_"):
+      raise RuntimeError(
+          "cache_context=True but no context cache was found; call fit()"
+          " first."
+      )
+
+    outputs = _decode_context_cache_pytorch(
+        self.model, self.ensemble_generator_, X_transformed,
+        self.context_caches_, self._context_n_members_, self.batch_size,
+        keep_cache_on_device=self.keep_cache_on_device,
+    )
+
+    _check_classifier_output_dim(outputs.shape[-1], self.n_classes_)
+    outputs = outputs[..., :self.n_classes_]
+
+    class_shift_offsets = []
+    for offsets in self.ensemble_generator_.class_shift_offsets_.values():
+      class_shift_offsets.extend(offsets)
+
+    all_logits = []
+    for i, offset in enumerate(class_shift_offsets):
+      out = outputs[i]
+      out = np.concatenate([out[..., offset:], out[..., :offset]], axis=-1)
+      all_logits.append(out)
+
+    return np.stack(all_logits, axis=0)
 
   @jt.typed
   def _batch_forward(
@@ -2468,7 +2914,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     """Drops memoized compiled predict functions from the pickled state.
 
     The first predict memoizes nnx.jit-compiled step functions on the
-    estimator (see _batch_forward). Those closures cannot be pickled; they
+    estimator (see _batch_forward()). Those closures cannot be pickled; they
     are pure caches and are rebuilt lazily on the next predict.
     """
     state = dict(super().__getstate__())
@@ -2668,6 +3114,10 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       )
 
     X_transformed = self.X_encoder_.transform(X)
+
+    if getattr(self, "cache_context", False):
+      return self._predict_proba_internal_cached(X_transformed)
+
     data = self.ensemble_generator_.transform(X_transformed)
     (
         Xs_all,
@@ -2834,6 +3284,9 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       enable_nnls: bool = False,
       nnls_beta: float = 0.75,
       min_rows_for_single_val_split: int = 2000,
+      cache_context: bool = False,
+      maybe_quantize_kv_cache: bool = True,
+      keep_cache_on_device: bool = True,
   ):
     """Initialises the regressor.
 
@@ -2866,6 +3319,25 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       min_rows_for_single_val_split: Minimum validation rows required to allow
         learning ensemble weights on a single train/val split instead of full
         CV. 0 means always doing full CV.
+      cache_context: If True, encode the in-context (training) rows once per
+        ensemble member at fit() time and reuse that cache (per-layer K/V
+        and column-embedder induced-point reprs) on every predict() call,
+        instead of re-encoding the full context on every call.
+        With maybe_quantize_kv_cache=False, the cached path is a pure speedup:
+        results are numerically identical (within floating point) to
+        cache_context=False. Only supported on the PyTorch backend; raises
+        NotImplementedError for JAX models.
+      maybe_quantize_kv_cache: If True (default) and cache_context=True,
+        int8-quantize each ensemble member's cached ICL K/V right after
+        fit() builds it (per-tensor symmetric quantization). This lets every
+        member's cache stay resident on the GPU at once without exhausting
+        device memory; it introduces small int8 rounding error, typically
+        negligible for reported metrics. Ignored when cache_context=False.
+      keep_cache_on_device: If True (default), keep every ensemble member's
+        context cache on the model's device between predict() calls. If False,
+        caches are moved to CPU after fit() and transferred back to the device
+        on every predict() call, trading latency for lower steady-state
+        device memory. Ignored when cache_context=False.
     """
     self.model = model
     self.n_estimators = n_estimators
@@ -2887,6 +3359,9 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     self.enable_nnls = enable_nnls
     self.nnls_beta = nnls_beta
     self.min_rows_for_single_val_split = min_rows_for_single_val_split
+    self.cache_context = cache_context
+    self.maybe_quantize_kv_cache = maybe_quantize_kv_cache
+    self.keep_cache_on_device = keep_cache_on_device
     if self.max_num_rows is not None and self.enable_nnls:
       raise ValueError(
           "max_num_rows and enable_nnls cannot both be set at this time."
@@ -2975,6 +3450,9 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     )
     self.ensemble_generator_.fit(X, y)
 
+    if self.cache_context:
+      self._build_context_cache()
+
     if self.enable_nnls:
       self.y_oof_scaled_ = self._compute_oof_preds_scaled(
           cv=self.num_folds_for_cv
@@ -3004,6 +3482,71 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       )
 
     return self
+
+  def _build_context_cache(self) -> None:
+    """Prefills and caches each ensemble member's in-context (training) rows.
+
+    Called from fit() when cache_context=True. Mirrors
+    TabFMClassifier._build_context_cache() via the shared
+    _build_context_cache_pytorch() helper: runs model.prefill() once
+    per ensemble member (batched the same way _batch_forward() batches the
+    uncached forward pass, via self.batch_size) and stores the resulting
+    caches on self.context_caches_ for later decoding of test rows (see
+    _predict_internal_cached()).
+
+    Only supported on the PyTorch backend: the JAX backend's prefill()/
+    decode() are not wired up here (this regressor's caching path assumes
+    the PyTorch TabFM.prefill()/decode() cache/tensor contracts).
+
+    Raises:
+      NotImplementedError: If self.model is not a PyTorch nn.Module.
+    """
+    is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
+    if not is_torch:
+      raise NotImplementedError(
+          "cache_context=True is only implemented for the PyTorch TabFM"
+          " backend; the JAX backend's prefill()/decode() are not wired up"
+          " here yet."
+      )
+
+    self.context_caches_, self._context_n_members_ = (
+        _build_context_cache_pytorch(
+            self.model, self.ensemble_generator_, self.batch_size,
+            maybe_quantize_kv_cache=self.maybe_quantize_kv_cache,
+            keep_cache_on_device=self.keep_cache_on_device,
+        )
+    )
+
+  def _predict_internal_cached(
+      self, X_transformed: np.ndarray
+  ) -> np.ndarray:
+    """cache_context=True counterpart of _predict_internal().
+
+    Decodes each ensemble member's test chunk against its cached context
+    (built once by _build_context_cache() at fit() time) via the shared
+    _decode_context_cache_pytorch() helper, then squeezes the trailing
+    singleton output dimension exactly as _predict_internal() does.
+
+    Args:
+      X_transformed: Already-X_encoder_-transformed test features.
+
+    Returns:
+      Array of shape (n_estimators_total, n_test_samples) of scaled
+      predictions, matching _predict_internal()'s return contract.
+    """
+    if not hasattr(self, "context_caches_"):
+      raise RuntimeError(
+          "cache_context=True but no context cache was found; call fit()"
+          " first."
+      )
+
+    outputs = _decode_context_cache_pytorch(
+        self.model, self.ensemble_generator_, X_transformed,
+        self.context_caches_, self._context_n_members_, self.batch_size,
+        keep_cache_on_device=self.keep_cache_on_device,
+    )
+    _check_regressor_output_dim(outputs.shape[-1])
+    return outputs.squeeze(-1)
 
   @jt.typed
   def _batch_forward(
@@ -3253,7 +3796,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     """Drops memoized compiled predict functions from the pickled state.
 
     The first predict memoizes nnx.jit-compiled step functions on the
-    estimator (see _batch_forward). Those closures cannot be pickled; they
+    estimator (see _batch_forward()). Those closures cannot be pickled; they
     are pure caches and are rebuilt lazily on the next predict.
     """
     state = dict(super().__getstate__())
@@ -3347,6 +3890,10 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       raise ValueError("The provided input X is one-dimensional. Reshape your data.")
 
     X_transformed = self.X_encoder_.transform(X)
+
+    if getattr(self, "cache_context", False):
+      return self._predict_internal_cached(X_transformed)
+
     data = self.ensemble_generator_.transform(X_transformed)
     (
         Xs_all,
