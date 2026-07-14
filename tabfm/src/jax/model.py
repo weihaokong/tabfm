@@ -2207,8 +2207,10 @@ class RetrievalDecoder(nnx.Module):
   one-hot labels as values, and the embeddings to classify act as queries.
   After learned linear projections W_Q / W_K and scaled dot-product
   attention, the head-averaged attention-weighted average of the one-hot
-  labels gives class probabilities, converted to logits with a clipped log
-  (constants follow TabPFN-3: ``log(clip(p, 1e-5) + 3e-5)``).
+  labels gives class probabilities, converted to logits as
+  ``log(p + 3e-5)`` -- TabPFN-3's ``log(clip(p, 1e-5) + 3e-5)`` without the
+  clamp, whose zero-gradient region below ``p = 1e-5`` would freeze learning
+  for classes with collapsed retrieval mass.
 
   There is no value projection -- the values are the one-hot labels
   themselves, so the output is a proper probability average per head.
@@ -2285,7 +2287,11 @@ class RetrievalDecoder(nnx.Module):
     one_hot = jax.nn.one_hot(key_y, self.max_classes, dtype=jnp.float32)
     # Head-averaged attention-weighted average of the one-hot labels.
     p = jnp.einsum('bhmn,bnk->bmk', attn, one_hot) / self.num_heads
-    logits = jnp.log(jnp.clip(p, 1e-5, None) + 3e-5)
+    # Smooth floor instead of TabPFN-3's ``log(clip(p, 1e-5) + 3e-5)``: same
+    # floor scale, but without the clamp, whose zero gradient below p = 1e-5
+    # froze learning for any class whose retrieval mass collapsed. ``p`` is
+    # float32 throughout, so the clamp was not needed for numerics either.
+    logits = jnp.log(p + 3e-5)
     return logits.astype(self.dtype)
 
 

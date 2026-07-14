@@ -888,14 +888,14 @@ class RetrievalDecoderTest(parameterized.TestCase):
     attn = np.exp(scores) / np.exp(scores).sum(axis=-1, keepdims=True)
     one_hot = np.eye(K)[np.asarray(y)]
     p = np.einsum('bhmn,bnk->bmk', attn, one_hot) / H
-    ref = np.log(np.clip(p, 1e-5, None) + 3e-5)
+    ref = np.log(p + 3e-5)
 
     chex.assert_shape(out, (B, M, K))
     chex.assert_trees_all_close(out, ref.astype(np.float32), atol=1e-4)
 
   def test_masked_rows_get_zero_weight(self):
     # A class that appears ONLY in masked key rows must receive exactly zero
-    # retrieval probability, i.e. the clipped-log floor log(1e-5 + 3e-5).
+    # retrieval probability, i.e. the floor log(0 + 3e-5).
     B, M, N, E, K = 1, 4, 6, 8, 3
     dec = tabfm_model.RetrievalDecoder(
         d_model=E, max_classes=K, head_dim=4, num_heads=2,
@@ -907,8 +907,31 @@ class RetrievalDecoderTest(parameterized.TestCase):
     y = jnp.array([[0, 1, 0, 1, 2, 2]])
     mask = jnp.array([[True, True, True, True, False, False]])
     out = dec(q_in, k_in, y, mask)
-    floor = np.log(1e-5 + 3e-5)
+    floor = np.log(3e-5)
     np.testing.assert_allclose(np.asarray(out[..., 2]), floor, rtol=1e-6)
+
+  def test_gradients_flow_below_old_clamp(self):
+    # The smooth floor must never kill gradients -- unlike the clamp it
+    # replaces, which had zero gradient for any class with retrieval mass
+    # below 1e-5.
+    B, M, N, E, K = 1, 3, 6, 8, 3
+    dec = tabfm_model.RetrievalDecoder(
+        d_model=E, max_classes=K, head_dim=4, num_heads=2,
+        rngs=self.rngs, dtype=jnp.float32,
+    )
+    q_in = jax.random.normal(jax.random.PRNGKey(1), (B, M, E))
+    k_in = jax.random.normal(jax.random.PRNGKey(2), (B, N, E))
+    y = jnp.array([[0, 1, 0, 1, 2, 2]])
+    mask = jnp.ones((B, N), dtype=bool)
+
+    def loss_fn(d):
+      logits = d(q_in, k_in, y, mask)
+      # Cross-entropy against class 2 everywhere (the rarest class).
+      return -jax.nn.log_softmax(logits, axis=-1)[..., 2].mean()
+
+    grads = nnx.grad(loss_fn)(dec)
+    self.assertGreater(float(jnp.abs(grads.q_proj.kernel.value).max()), 0.0)
+    self.assertGreater(float(jnp.abs(grads.k_proj.kernel.value).max()), 0.0)
 
   def test_retrieval_decoder_rejects_regression(self):
     with self.assertRaises(ValueError):
