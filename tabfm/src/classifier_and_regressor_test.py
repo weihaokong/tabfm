@@ -27,6 +27,7 @@ try:
 except ImportError:
   HAS_JAX = False
 from tabfm.src.classifier_and_regressor import _looks_like_datetime
+from tabfm.src.classifier_and_regressor import greedy_ensemble_selection
 from tabfm.src.classifier_and_regressor import EnsembleGenerator
 from tabfm.src.classifier_and_regressor import TabFMClassifier
 from tabfm.src.classifier_and_regressor import TabFMRegressor
@@ -1006,7 +1007,8 @@ class EnsemblePresetTest(absltest.TestCase):
     self.assertFalse(clf.average_logits)
     self.assertEqual(clf.n_feature_crosses, "sqrt")
     self.assertEqual(clf.n_svd_features, "sqrt")
-    self.assertTrue(clf.enable_nnls)
+    self.assertEqual(clf.ensemble_method, "greedy")
+    self.assertEqual(clf._resolved_ensemble_method(), "greedy")
     self.assertEqual(clf.binary_calibration_method, "platt")
     self.assertEqual(clf.multiclass_calibration_method, "vector")
     # Default-mode knobs are unchanged by the preset.
@@ -1017,15 +1019,16 @@ class EnsemblePresetTest(absltest.TestCase):
     self.assertEqual(reg.n_estimators, 32)
     self.assertEqual(reg.n_feature_crosses, "sqrt")
     self.assertEqual(reg.n_svd_features, "sqrt")
-    self.assertTrue(reg.enable_nnls)
+    self.assertEqual(reg.ensemble_method, "greedy")
+    self.assertEqual(reg._resolved_ensemble_method(), "greedy")
     self.assertEqual(reg.max_num_features, 500)
 
   def test_ensemble_overrides_take_precedence(self):
     clf = TabFMClassifier.ensemble(
-        model=mock.Mock(), n_estimators=8, enable_nnls=False
+        model=mock.Mock(), n_estimators=8, ensemble_method="mean"
     )
     self.assertEqual(clf.n_estimators, 8)
-    self.assertFalse(clf.enable_nnls)
+    self.assertEqual(clf._resolved_ensemble_method(), "mean")
     # Non-overridden preset values are preserved.
     self.assertEqual(clf.n_feature_crosses, "sqrt")
 
@@ -1037,6 +1040,7 @@ class EnsemblePresetTest(absltest.TestCase):
     self.assertEqual(clf.n_feature_crosses, 0)
     self.assertEqual(clf.n_svd_features, 0)
     self.assertFalse(clf.enable_nnls)
+    self.assertEqual(clf._resolved_ensemble_method(), "mean")
     self.assertIsNone(clf.binary_calibration_method)
 
 
@@ -1200,5 +1204,155 @@ class ColumnNameRobustnessTest(absltest.TestCase):
     self.assertEqual(out.shape, (4, 5))  # unix-ns + 4 derived features
 
 
+class GreedyEnsembleSelectionTest(absltest.TestCase):
+  """Unit tests for the Caruana-style greedy ensemble selection helper."""
+
+  def test_perfect_member_gets_all_weight(self):
+    y = np.array([1.0, 2.0, 3.0, 4.0])
+    preds = np.stack([y, y + 5.0, y - 3.0])
+
+    def rmse(p):
+      return float(np.sqrt(np.mean((p - y) ** 2)))
+
+    weights = greedy_ensemble_selection(preds, error_fn=rmse, rounds=10)
+    np.testing.assert_allclose(weights, [1.0, 0.0, 0.0])
+
+  def test_weights_form_a_simplex(self):
+    rng = np.random.RandomState(0)
+    y = rng.rand(20)
+    preds = rng.rand(4, 20)
+
+    def rmse(p):
+      return float(np.sqrt(np.mean((p - y) ** 2)))
+
+    weights = greedy_ensemble_selection(
+        preds, error_fn=rmse, rounds=25, random_state=0
+    )
+    self.assertEqual(weights.shape, (4,))
+    self.assertTrue(np.all(weights >= 0))
+    self.assertAlmostEqual(np.sum(weights), 1.0)
+
+  def test_complementary_members_are_blended(self):
+    # Two members with equal-and-opposite bias: their average is perfect, so
+    # greedy selection should weight them equally.
+    y = np.zeros(8)
+    preds = np.stack([y + 1.0, y - 1.0])
+
+    def rmse(p):
+      return float(np.sqrt(np.mean((p - y) ** 2)))
+
+    weights = greedy_ensemble_selection(
+        preds, error_fn=rmse, rounds=10, random_state=0
+    )
+    np.testing.assert_allclose(weights, [0.5, 0.5])
+
+  def test_probability_renormalization(self):
+    rng = np.random.RandomState(0)
+    y = np.array([0, 1, 0, 1])
+    preds = rng.dirichlet([1, 1], size=(3, 4))
+
+    def log_loss(p):
+      eps = 1e-15
+      return float(-np.mean(np.log(np.clip(p[np.arange(4), y], eps, None))))
+
+    weights = greedy_ensemble_selection(
+        preds, error_fn=log_loss, rounds=25, renormalize=True, random_state=0
+    )
+    self.assertEqual(weights.shape, (3,))
+    self.assertAlmostEqual(np.sum(weights), 1.0)
+
+
+@unittest.skipUnless(HAS_JAX, "JAX is required")
+class GreedyEnsembleEstimatorTest(absltest.TestCase):
+  """End-to-end tests of ensemble_method="greedy" in the estimators."""
+
+  def _tiny_model(self, loss, max_classes):
+    return tabfm_model.TabFM(
+        loss=loss,
+        max_classes=max_classes,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=1,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        rngs=nnx.Rngs(0),
+    )
+
+  def test_regressor_greedy_ensemble(self):
+    regressor = TabFMRegressor(
+        model=self._tiny_model("rmse", 10),
+        n_estimators=2,
+        batch_size=2,
+        ensemble_method="greedy",
+        ensemble_selection_rounds=10,
+    )
+
+    X = np.random.rand(10, 3)
+    y = np.random.rand(10)
+
+    def mock_forward(Xs_batch, ys_batch, _cat_mask_batch=None, **_kwargs):
+      test_size = Xs_batch.shape[1] - ys_batch.shape[1]
+      return np.zeros((Xs_batch.shape[0], test_size, 1))
+
+    with mock.patch.object(
+        regressor, "_batch_forward", side_effect=mock_forward
+    ):
+      regressor.fit(X, y)
+
+      self.assertTrue(hasattr(regressor, "ensemble_weights_"))
+      self.assertEqual(regressor.ensemble_weights_.shape, (2,))
+      self.assertAlmostEqual(np.sum(regressor.ensemble_weights_), 1.0)
+      self.assertTrue(np.all(regressor.ensemble_weights_ >= 0))
+
+      test_preds = regressor.predict(X[:3])
+      self.assertEqual(test_preds.shape, (3,))
+
+  def test_classifier_greedy_ensemble(self):
+    classifier = TabFMClassifier(
+        model=self._tiny_model("cross_entropy", 2),
+        n_estimators=2,
+        ensemble_method="greedy",
+        ensemble_selection_rounds=10,
+        average_logits=False,
+    )
+
+    X = np.random.rand(10, 3)
+    y = np.array([0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
+
+    mock_oof = np.random.dirichlet([1, 1], size=(2, 10))
+
+    with mock.patch.object(
+        classifier, "predict_oof_proba", return_value=mock_oof
+    ):
+      classifier.fit(X, y)
+
+    self.assertTrue(hasattr(classifier, "ensemble_weights_"))
+    self.assertEqual(classifier.ensemble_weights_.shape, (2,))
+    self.assertAlmostEqual(np.sum(classifier.ensemble_weights_), 1.0)
+    self.assertTrue(np.all(classifier.ensemble_weights_ >= 0))
+
+    mock_logits = np.random.rand(2, 5, 2)
+    with mock.patch.object(
+        classifier, "_predict_proba_internal", return_value=mock_logits
+    ):
+      probs = classifier.predict_proba(X[:5])
+      self.assertEqual(probs.shape, (5, 2))
+
+  def test_greedy_rejects_average_logits(self):
+    with self.assertRaises(ValueError):
+      TabFMClassifier(
+          model=mock.Mock(), ensemble_method="greedy", average_logits=True
+      )
+
+  def test_unknown_ensemble_method_rejected(self):
+    with self.assertRaises(ValueError):
+      TabFMRegressor(model=mock.Mock(), ensemble_method="banana")
+
+
 if __name__ == "__main__":
   absltest.main()
+

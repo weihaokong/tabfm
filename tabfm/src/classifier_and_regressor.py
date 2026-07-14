@@ -1102,6 +1102,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
       max_num_rows: Optional[int] = None,
       n_feature_crosses: Union[int, str] = 0,
       n_svd_features: Union[int, str] = 0,
+      feature_allocation: str = "split",
       total_svd_pool: Optional[int] = None,
       random_state: Optional[int] = None,
       task: str = "classification",
@@ -1127,6 +1128,10 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
         crosses per ensemble member, or ``0`` to disable.
       n_svd_features: ``"sqrt"`` to add sqrt(n_features) random SVD features per
         ensemble member, or ``0`` to disable.
+      feature_allocation: ``"split"`` alternates augmented / non-augmented
+        members (the default ensemble diversity); ``"all"`` gives every member
+        the full feature-cross / SVD augmentation (use with ``n_estimators=1``
+        to build a single self-contained augmented view).
       total_svd_pool: Total pool size of SVD features to generate.
       task: Either ``"classification"`` or ``"regression"``.
     """
@@ -1141,6 +1146,7 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     self.max_num_rows = max_num_rows
     self.n_feature_crosses = n_feature_crosses
     self.n_svd_features = n_svd_features
+    self.feature_allocation = feature_allocation
     self.total_svd_pool = total_svd_pool
     self.random_state = random_state
     self.task = task
@@ -1165,11 +1171,17 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
   ) -> List[int]:
     """Resolves the number of features to add for each ensemble member.
 
-    Uses the "split" allocation: even-indexed members get no added features
-    while odd-indexed members get the full ``k_max``, yielding a diverse mix
-    of augmented and non-augmented views.
+    ``feature_allocation`` selects the pattern:
+      * ``"split"`` (default): even-indexed members get no added features while
+        odd-indexed members get the full ``k_max`` -- a diverse mix of augmented
+        and non-augmented views within one ensemble.
+      * ``"all"``: every member gets the full ``k_max``. Use this to build a
+        single self-contained augmented view (``n_estimators=1``), e.g. when the
+        ensembling is done outside this estimator.
     """
     k_max = self._get_n_features_to_add(n_features_requested, n_cols)
+    if self.feature_allocation == "all":
+      return [k_max for _ in range(self.n_estimators)]
     return [0 if i % 2 == 0 else k_max for i in range(self.n_estimators)]
 
   def fit(self, X: Any, y: Any) -> "EnsembleGenerator":
@@ -1875,6 +1887,84 @@ def _check_regressor_output_dim(output_dim: int) -> None:
     )
 
 
+
+# ---------------------------------------------------------------------------
+# Ensemble weighting
+# ---------------------------------------------------------------------------
+
+
+def greedy_ensemble_selection(
+    predictions: np.ndarray,
+    error_fn: Any,
+    rounds: int = 25,
+    renormalize: bool = False,
+    random_state: Optional[int] = None,
+) -> np.ndarray:
+  """Computes ensemble weights via greedy forward selection with replacement.
+
+  Implements the ensemble-selection algorithm of Caruana et al. (2004) as used
+  by AutoGluon's weighted ensemble (the TabArena reference setup): starting
+  from an empty ensemble, each round adds the member (with replacement) whose
+  inclusion minimizes the error of the running ensemble mean.  Ties prefer
+  members already selected (keeps the ensemble small), then break randomly.
+  The selection trajectory is truncated at its error minimum ("use best"), and
+  each member's final weight is its selection count, normalized to sum to one.
+
+  Args:
+    predictions: Out-of-fold predictions per ensemble member, of shape
+      ``(n_estimators, n_samples)`` for regression or
+      ``(n_estimators, n_samples, n_classes)`` for classification.
+    error_fn: Callable mapping an ensemble prediction (same shape as one
+      member's predictions) to a scalar error to minimize, e.g. RMSE against
+      the training targets or log-loss.
+    rounds: Number of greedy selection rounds.  Defaults to 25, matching
+      AutoGluon (per TabRepo, larger values give no measurable improvement).
+    renormalize: Whether to renormalize candidate ensemble predictions to sum
+      to one along the last axis before scoring (for class probabilities).
+    random_state: Seed for random tie-breaking.
+
+  Returns:
+    np.ndarray of shape (n_estimators,) with non-negative weights summing to 1.
+  """
+  predictions = np.asarray(predictions)
+  n_estimators = predictions.shape[0]
+  rng = np.random.RandomState(random_state)
+
+  order = []
+  trajectory = []
+  ensemble_sum = np.zeros(predictions.shape[1:])
+  for _ in range(rounds):
+    s = len(order)
+    scores = np.zeros(n_estimators)
+    for j in range(n_estimators):
+      candidate = (ensemble_sum + predictions[j]) / float(s + 1)
+      if renormalize:
+        denom = candidate.sum(axis=-1, keepdims=True)
+        candidate = candidate / np.where(denom == 0, 1.0, denom)
+      scores[j] = error_fn(candidate)
+    best_score = np.nanmin(scores)
+    all_best = np.flatnonzero(
+        np.isclose(scores, best_score, atol=0, rtol=1e-12)
+    )
+    if len(all_best) > 1 and order:
+      already_used = [j for j in all_best if j in order]
+      if already_used:
+        all_best = np.asarray(already_used)
+    order.append(int(rng.choice(all_best)))
+    trajectory.append(scores[order[-1]])
+    ensemble_sum += predictions[order[-1]]
+    if n_estimators == 1:
+      break
+
+  # Truncate the trajectory at its error minimum ("use best" in AutoGluon).
+  order = order[: int(np.argmin(trajectory)) + 1]
+
+  weights = np.zeros(n_estimators)
+  for j in order:
+    weights[j] += 1.0
+  return weights / np.sum(weights)
+
+
 # ---------------------------------------------------------------------------
 # Classifier
 # ---------------------------------------------------------------------------
@@ -1897,7 +1987,8 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     ensemble_generator_: Fitted ``EnsembleGenerator``.
     active_calibration_method_: Resolved calibration method name ("platt" for
       binary, "vector" for multiclass, or None).
-    ensemble_weights_: Blending weights for ensemble members computed via NNLS.
+    ensemble_weights_: Blending weights for ensemble members, computed via
+      NNLS or greedy ensemble selection.
     calibration_lambda: L2 regularization strength for calibration parameter
       scaling.
   """
@@ -1934,9 +2025,13 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       num_folds_for_cv: int = 5,
       n_feature_crosses: Union[int, str] = 0,
       n_svd_features: Union[int, str] = 0,
+      feature_allocation: str = "split",
       total_svd_pool: Optional[int] = None,
       enable_nnls: bool = False,
       nnls_beta: float = 0.75,
+      ensemble_method: Optional[str] = None,
+      ensemble_selection_rounds: int = 25,
+      member_index: Optional[int] = None,
       calibration_lambda: float = 1e-2,
       min_rows_for_single_val_split: int = 2000,
   ):
@@ -1974,9 +2069,23 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         crosses per ensemble member, or ``0`` to disable.
       n_svd_features: ``"sqrt"`` to add sqrt(n_features) random SVD features per
         ensemble member, or ``0`` to disable.
+      feature_allocation: ``"split"`` alternates augmented / non-augmented
+        members (the default ensemble diversity); ``"all"`` gives every member
+        the full feature-cross / SVD augmentation (use with ``n_estimators=1``
+        to build a single self-contained augmented view).
       total_svd_pool: Total pool size of SVD features to generate.
-      enable_nnls: Whether to enable NNLS weighted ensemble.
+      enable_nnls: Whether to enable NNLS weighted ensemble.  Deprecated in
+        favor of ``ensemble_method="nnls"``; ignored when ``ensemble_method``
+        is set.
       nnls_beta: Blending weight for NNLS.
+      ensemble_method: How to combine ensemble members: ``"mean"`` (simple
+        average), ``"nnls"`` (non-negative least squares on out-of-fold
+        predictions, blended with uniform via ``nnls_beta``), or ``"greedy"``
+        (Caruana-style greedy ensemble selection on out-of-fold predictions,
+        as used by AutoGluon / TabArena).  ``None`` falls back to
+        ``enable_nnls``.
+      ensemble_selection_rounds: Number of greedy selection rounds when
+        ``ensemble_method="greedy"``.
       calibration_lambda: L2 regularization strength for calibration parameter
         scaling.
       min_rows_for_single_val_split: Minimum validation rows required to allow
@@ -2004,26 +2113,51 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     self.num_folds_for_cv = num_folds_for_cv
     self.n_feature_crosses = n_feature_crosses
     self.n_svd_features = n_svd_features
+    self.feature_allocation = feature_allocation
     self.total_svd_pool = total_svd_pool
     self.enable_nnls = enable_nnls
     self.nnls_beta = nnls_beta
+    self.ensemble_method = ensemble_method
+    self.ensemble_selection_rounds = ensemble_selection_rounds
+    self.member_index = member_index
     self.calibration_lambda = calibration_lambda
     self.min_rows_for_single_val_split = min_rows_for_single_val_split
-    if self.average_logits and self.enable_nnls:
-      raise ValueError("average_logits and enable_nnls cannot both be True.")
-    if self.max_num_rows is not None and self.enable_nnls:
+    if self._resolved_ensemble_method() not in ("mean", "nnls", "greedy"):
       raise ValueError(
-          "max_num_rows and enable_nnls cannot both be set at this time."
+          f"Unknown ensemble_method: {ensemble_method!r}. Must be one of"
+          " 'mean', 'nnls', 'greedy'."
       )
+    if self.average_logits and self._resolved_ensemble_method() != "mean":
+      raise ValueError(
+          "average_logits cannot be combined with a weighted ensemble"
+          " (enable_nnls / ensemble_method)."
+      )
+    if self.max_num_rows is not None and (
+        self._resolved_ensemble_method() != "mean"
+    ):
+      raise ValueError(
+          "max_num_rows cannot be combined with a weighted ensemble"
+          " (enable_nnls / ensemble_method) at this time."
+      )
+
+  def _resolved_ensemble_method(self) -> str:
+    """Resolves the ensemble weighting method.
+
+    ``ensemble_method`` takes precedence when set; otherwise falls back to
+    ``enable_nnls`` for backward compatibility.
+    """
+    if self.ensemble_method is not None:
+      return self.ensemble_method
+    return "nnls" if self.enable_nnls else "mean"
 
   @classmethod
   def ensemble(cls, model: Any, **overrides: Any) -> "TabFMClassifier":
     """Constructs a classifier with the "ensemble" preset.
 
     Enables the heavier ensembling/calibration features on top of the default
-    configuration: square-root feature-cross and SVD schedules, NNLS-weighted
-    blending, probability (rather than logit) averaging, and per-problem
-    calibration. Any keyword in ``overrides`` takes precedence over the preset.
+    configuration: square-root feature-cross and SVD schedules, greedy
+    ensemble selection (as used by AutoGluon / TabArena), probability (rather
+    than logit) averaging, and per-problem calibration. Any keyword in ``overrides`` takes precedence over the preset.
 
     Args:
       model: Pre-trained TabFM model (NNX module).
@@ -2037,7 +2171,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         average_logits=False,
         n_feature_crosses="sqrt",
         n_svd_features="sqrt",
-        enable_nnls=True,
+        ensemble_method="greedy",
         binary_calibration_method="platt",
         multiclass_calibration_method="vector",
     )
@@ -2131,12 +2265,13 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         random_state=self.random_state,
         n_feature_crosses=self.n_feature_crosses,
         n_svd_features=self.n_svd_features,
+        feature_allocation=self.feature_allocation,
         total_svd_pool=self.total_svd_pool,
     )
     self.ensemble_generator_.fit(X, y)
 
     oof_probs_fit = None
-    if self.enable_nnls or (
+    if self._resolved_ensemble_method() != "mean" or (
         self.active_calibration_method_ is not None
         and self.active_calibration_method_ != "none"
     ):
@@ -2151,7 +2286,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         y_orig_fit = y_orig
         y_fit = y
 
-    if self.enable_nnls and oof_probs_fit is not None:
+    if self._resolved_ensemble_method() == "nnls" and oof_probs_fit is not None:
       n_classes = self.n_classes_
       n_est, n_tr, _ = oof_probs_fit.shape
 
@@ -2177,11 +2312,32 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       )
 
     if (
+        self._resolved_ensemble_method() == "greedy"
+        and oof_probs_fit is not None
+    ):
+      n_tr = oof_probs_fit.shape[1]
+      row_idx = np.arange(n_tr)
+
+      def _log_loss(probs: np.ndarray) -> float:
+        eps = 1e-15
+        return float(
+            -np.mean(np.log(np.clip(probs[row_idx, y_orig_fit], eps, None)))
+        )
+
+      self.ensemble_weights_ = greedy_ensemble_selection(
+          oof_probs_fit,
+          error_fn=_log_loss,
+          rounds=self.ensemble_selection_rounds,
+          renormalize=True,
+          random_state=self.random_state,
+      )
+
+    if (
         self.active_calibration_method_ is not None
         and self.active_calibration_method_ != "none"
         and oof_probs_fit is not None
     ):
-      if self.enable_nnls:
+      if self._resolved_ensemble_method() != "mean":
         P = np.tensordot(self.ensemble_weights_, oof_probs_fit, axes=(0, 0))
       else:
         P = np.mean(oof_probs_fit, axis=0)
@@ -2677,14 +2833,27 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         _,
     ) = self.ensemble_generator_.prepare_ensemble_tensors(data)
 
+    if self.member_index is not None:
+      # Run only member ``member_index`` of the (fully-generated) ensemble.
+      mi = self.member_index
+      Xs_all = Xs_all[mi : mi + 1]
+      ys_all = ys_all[mi : mi + 1]
+      cat_masks_all = cat_masks_all[mi : mi + 1]
+      ds_all = ds_all[mi : mi + 1]
+
     outputs = self._batch_forward(Xs_all, ys_all, cat_masks_all, ds=ds_all)
     _check_classifier_output_dim(outputs.shape[-1], self.n_classes_)
     outputs = outputs[..., :self.n_classes_]
 
-    # Extract class shift offsets from ensemble generator
+    # Extract class shift offsets from ensemble generator (same flat member
+    # order as the tensors), selecting the single member when requested.
     class_shift_offsets = []
     for offsets in self.ensemble_generator_.class_shift_offsets_.values():
       class_shift_offsets.extend(offsets)
+    if self.member_index is not None:
+      class_shift_offsets = class_shift_offsets[
+          self.member_index : self.member_index + 1
+      ]
 
     # Correct for class shifts and return raw logits for all estimators
     all_logits = []
@@ -2700,7 +2869,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         logits_all, axis=-1, temperature=self.softmax_temperature
     )
 
-    if self.enable_nnls:
+    if self._resolved_ensemble_method() != "mean":
       probs = np.tensordot(self.ensemble_weights_, probs_all, axes=(0, 0))
     elif self.average_logits:
       avg_logits = np.mean(logits_all, axis=0)
@@ -2803,7 +2972,8 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     y_scaler_: Fitted ``StandardScaler`` for target standardization.
     ensemble_generator_: Fitted ``EnsembleGenerator``.
     y_oof_scaled_: Out-of-fold scaled target predictions for the training set.
-    ensemble_weights_: Blending weights for ensemble members computed via NNLS.
+    ensemble_weights_: Blending weights for ensemble members, computed via
+      NNLS or greedy ensemble selection.
   """
 
   X_encoder_: TransformToNumerical
@@ -2830,9 +3000,13 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       num_folds_for_cv: int = 5,
       n_feature_crosses: Union[int, str] = 0,
       n_svd_features: Union[int, str] = 0,
+      feature_allocation: str = "split",
       total_svd_pool: Optional[int] = None,
       enable_nnls: bool = False,
       nnls_beta: float = 0.75,
+      ensemble_method: Optional[str] = None,
+      ensemble_selection_rounds: int = 25,
+      member_index: Optional[int] = None,
       min_rows_for_single_val_split: int = 2000,
   ):
     """Initialises the regressor.
@@ -2860,9 +3034,23 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
         crosses per ensemble member, or ``0`` to disable.
       n_svd_features: ``"sqrt"`` to add sqrt(n_features) random SVD features per
         ensemble member, or ``0`` to disable.
+      feature_allocation: ``"split"`` alternates augmented / non-augmented
+        members (the default ensemble diversity); ``"all"`` gives every member
+        the full feature-cross / SVD augmentation (use with ``n_estimators=1``
+        to build a single self-contained augmented view).
       total_svd_pool: Total pool size of SVD features to generate.
-      enable_nnls: Whether to enable NNLS weighted ensemble.
+      enable_nnls: Whether to enable NNLS weighted ensemble.  Deprecated in
+        favor of ``ensemble_method="nnls"``; ignored when ``ensemble_method``
+        is set.
       nnls_beta: Blending weight for NNLS.
+      ensemble_method: How to combine ensemble members: ``"mean"`` (simple
+        average), ``"nnls"`` (non-negative least squares on out-of-fold
+        predictions, blended with uniform via ``nnls_beta``), or ``"greedy"``
+        (Caruana-style greedy ensemble selection on out-of-fold predictions,
+        as used by AutoGluon / TabArena).  ``None`` falls back to
+        ``enable_nnls``.
+      ensemble_selection_rounds: Number of greedy selection rounds when
+        ``ensemble_method="greedy"``.
       min_rows_for_single_val_split: Minimum validation rows required to allow
         learning ensemble weights on a single train/val split instead of full
         CV. 0 means always doing full CV.
@@ -2883,22 +3071,45 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     self.num_folds_for_cv = num_folds_for_cv
     self.n_feature_crosses = n_feature_crosses
     self.n_svd_features = n_svd_features
+    self.feature_allocation = feature_allocation
     self.total_svd_pool = total_svd_pool
     self.enable_nnls = enable_nnls
     self.nnls_beta = nnls_beta
+    self.ensemble_method = ensemble_method
+    self.ensemble_selection_rounds = ensemble_selection_rounds
+    self.member_index = member_index
     self.min_rows_for_single_val_split = min_rows_for_single_val_split
-    if self.max_num_rows is not None and self.enable_nnls:
+    if self._resolved_ensemble_method() not in ("mean", "nnls", "greedy"):
       raise ValueError(
-          "max_num_rows and enable_nnls cannot both be set at this time."
+          f"Unknown ensemble_method: {ensemble_method!r}. Must be one of"
+          " 'mean', 'nnls', 'greedy'."
       )
+    if self.max_num_rows is not None and (
+        self._resolved_ensemble_method() != "mean"
+    ):
+      raise ValueError(
+          "max_num_rows cannot be combined with a weighted ensemble"
+          " (enable_nnls / ensemble_method) at this time."
+      )
+
+  def _resolved_ensemble_method(self) -> str:
+    """Resolves the ensemble weighting method.
+
+    ``ensemble_method`` takes precedence when set; otherwise falls back to
+    ``enable_nnls`` for backward compatibility.
+    """
+    if self.ensemble_method is not None:
+      return self.ensemble_method
+    return "nnls" if self.enable_nnls else "mean"
 
   @classmethod
   def ensemble(cls, model: Any, **overrides: Any) -> "TabFMRegressor":
     """Constructs a regressor with the "ensemble" preset.
 
     Enables the heavier ensembling features on top of the default configuration:
-    square-root feature-cross and SVD schedules and NNLS-weighted blending. Any
-    keyword in ``overrides`` takes precedence over the preset.
+    square-root feature-cross and SVD schedules and greedy ensemble selection
+    (as used by AutoGluon / TabArena). Any keyword in ``overrides`` takes
+    precedence over the preset.
 
     Args:
       model: Pre-trained TabFM model (NNX module).
@@ -2911,7 +3122,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
         n_estimators=32,
         n_feature_crosses="sqrt",
         n_svd_features="sqrt",
-        enable_nnls=True,
+        ensemble_method="greedy",
     )
     params.update(overrides)
     return cls(model, **params)
@@ -2971,11 +3182,12 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
         task="regression",
         n_feature_crosses=self.n_feature_crosses,
         n_svd_features=self.n_svd_features,
+        feature_allocation=self.feature_allocation,
         total_svd_pool=self.total_svd_pool,
     )
     self.ensemble_generator_.fit(X, y)
 
-    if self.enable_nnls:
+    if self._resolved_ensemble_method() != "mean":
       self.y_oof_scaled_ = self._compute_oof_preds_scaled(
           cv=self.num_folds_for_cv
       )
@@ -2991,17 +3203,29 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       for i in range(n_est):
         y_oof[i, :] = self._inverse_transform_y(y_oof_scaled_fit[i])
 
-      weights, _ = opt.nnls(y_oof.T, y_orig_fit)
-      sum_weights = np.sum(weights)
-      if sum_weights > 0:
-        weights = weights / sum_weights
-      else:
-        weights = np.ones(n_est) / n_est
+      if self._resolved_ensemble_method() == "greedy":
 
-      avg_weights = np.ones(n_est) / n_est
-      self.ensemble_weights_ = (
-          self.nnls_beta * weights + (1.0 - self.nnls_beta) * avg_weights
-      )
+        def _rmse(preds: np.ndarray) -> float:
+          return float(np.sqrt(np.mean((preds - y_orig_fit) ** 2)))
+
+        self.ensemble_weights_ = greedy_ensemble_selection(
+            y_oof,
+            error_fn=_rmse,
+            rounds=self.ensemble_selection_rounds,
+            random_state=self.random_state,
+        )
+      else:
+        weights, _ = opt.nnls(y_oof.T, y_orig_fit)
+        sum_weights = np.sum(weights)
+        if sum_weights > 0:
+          weights = weights / sum_weights
+        else:
+          weights = np.ones(n_est) / n_est
+
+        avg_weights = np.ones(n_est) / n_est
+        self.ensemble_weights_ = (
+            self.nnls_beta * weights + (1.0 - self.nnls_beta) * avg_weights
+        )
 
     return self
 
@@ -3356,6 +3580,16 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
         _,
     ) = self.ensemble_generator_.prepare_ensemble_tensors(data)
 
+    if self.member_index is not None:
+      # Run only member ``member_index`` of the (fully-generated) ensemble, so
+      # this estimator reproduces exactly that one view -- used to expose each
+      # ensemble member as a standalone model (ensembling done externally).
+      mi = self.member_index
+      Xs_all = Xs_all[mi : mi + 1]
+      ys_all = ys_all[mi : mi + 1]
+      cat_masks_all = cat_masks_all[mi : mi + 1]
+      ds_all = ds_all[mi : mi + 1]
+
     output = self._batch_forward(Xs_all, ys_all, cat_masks_all, ds=ds_all)
     _check_regressor_output_dim(output.shape[-1])
     predictions = output.squeeze(-1)
@@ -3367,7 +3601,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
   ) -> jt.Float[Array | np.ndarray, "T"]:
     """Combine scaled predictions from ensemble members into final prediction."""
     n_est = predictions_scaled.shape[0]
-    if self.enable_nnls:
+    if self._resolved_ensemble_method() != "mean":
       test_preds = np.zeros((n_est, predictions_scaled.shape[1]))
       for i in range(n_est):
         test_preds[i, :] = self._inverse_transform_y(predictions_scaled[i])
