@@ -26,42 +26,69 @@ Key classes:
   - TabFMRegressor:  sklearn-compatible TabFM regressor.
 """
 
-import argparse
 import collections
 import itertools
 import math
-import os
 import random
-import sys
-from collections import OrderedDict
-from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from absl import flags, logging
-from flax import nnx
-import jax
-import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
+from absl import logging
 import numpy as np
 
+try:
+  import jax
+  import jax.numpy as jnp
+  from flax import nnx
+  from jax.experimental import multihost_utils
+  from jax.sharding import NamedSharding, PartitionSpec
+  HAS_JAX = True
+  Array = jax.Array
+except ImportError:
+  HAS_JAX = False
+  Array = np.ndarray  # Fallback for type annotation parser
+
+try:
+  import torch
+  HAS_TORCH = True
+except ImportError:
+  HAS_TORCH = False
 import pandas as pd
-from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, TransformerMixin
+import scipy.optimize as opt
+import scipy.special
+from sklearn.base import BaseEstimator
+from sklearn.base import ClassifierMixin
+from sklearn.base import RegressorMixin
+from sklearn.base import TransformerMixin
 from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import TruncatedSVD
 from sklearn.impute import SimpleImputer
+from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import (
-    FunctionTransformer,
-    PowerTransformer,
-    QuantileTransformer,
-    RobustScaler,
-    StandardScaler,
-)
+from sklearn.preprocessing import FunctionTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import PowerTransformer
+from sklearn.preprocessing import QuantileTransformer
+from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.utils import check_array
 from sklearn.utils.multiclass import check_classification_targets
-from sklearn.utils.validation import check_is_fitted, validate_data
+from sklearn.utils.validation import check_is_fitted
+from sklearn.utils.validation import validate_data
 
-import jaxtyping as jt; import typeguard; import numpy as np; jt.typed = jt.jaxtyped(typechecker=typeguard.typechecked)
+import jaxtyping as jt
+import typeguard
 
+jt.typed = jt.jaxtyped(typechecker=typeguard.typechecked)
+
+# pylint: disable=invalid-name
+
+# Single source of truth for the default ensemble seed. Threaded into both
+# estimators and, from there, into every stochastic component (KFold OOF
+# cross-fit, SVD, quantile normalizer, feature crosses / row subsampling,
+# class shift). Type-detection heuristics are deliberately NOT seeded from
+# this -- column-type detection must stay stable across ensemble seeds so the
+# feature schema doesn't change when only the model seed varies.
+_DEFAULT_RANDOM_STATE = 42
 
 # ---------------------------------------------------------------------------
 # Preprocessing utilities
@@ -84,6 +111,8 @@ class CategoricalOrdinalEncoder(BaseEstimator, TransformerMixin):
         data (original behaviour).
       - ``"frequency"``: categories are sorted by descending frequency, so
         the most common category receives index 0.
+      - ``"alphabetical"``: categories are sorted ascending (alphabetically),
+        matching scikit-learn's ``LabelEncoder`` convention.
   """
 
   categories_: List[np.ndarray]
@@ -126,28 +155,34 @@ class CategoricalOrdinalEncoder(BaseEstimator, TransformerMixin):
       counts = pd.Series(col).value_counts()
       rare_cats = counts[counts < self.min_frequency].index
 
+      # Determine the candidate categories in the order dictated by the mode.
       if self.mode == "frequency":
-        # Sort by descending frequency; ties broken by appearance order via
-        # stable sort (value_counts preserves insertion order for equal counts
-        # only in pandas >= 1.1 with sort=True, so we use the counts index
-        # directly which is already frequency-sorted).
-        uniques_sorted = counts.index.tolist()
-        # Filter NaNs and string "nan"
-        uniques = [
-            u
-            for u in uniques_sorted
-            if not pd.isna(u) and str(u) != "nan" and u not in rare_cats
-        ]
+        # Descending frequency. value_counts is already frequency-sorted, with
+        # ties broken by appearance order via pandas' stable sort.
+        candidates = counts.index.tolist()
+      elif self.mode == "appearance":
+        # Order of first appearance.
+        candidates = pd.unique(col)
+      elif self.mode == "alphabetical":
+        # Order of first appearance; sorted below once NaNs are removed.
+        candidates = pd.unique(col)
       else:
-        # Default: order of appearance
-        uniques = pd.unique(col)
-        # Filter NaNs
-        mask = ~pd.isna(uniques)
-        uniques = uniques[mask]
-        # Filter string "nan" if present to match TF behavior
-        uniques = [u for u in uniques if str(u) != "nan"]
-        # Filter rare categories
-        uniques = [u for u in uniques if u not in rare_cats]
+        raise ValueError(
+            f"Unknown mode: {self.mode!r}. Expected one of 'appearance', "
+            "'alphabetical', or 'frequency'."
+        )
+
+      # Drop NaNs, the literal string "nan" (to match TF behavior), and rare
+      # categories.
+      uniques = [
+          u
+          for u in candidates
+          if not pd.isna(u) and str(u) != "nan" and u not in rare_cats
+      ]
+      if self.mode == "alphabetical":
+        # Sort categories so encoding matches sklearn's LabelEncoder convention
+        # (classes ordered ascending / alphabetically).
+        uniques = sorted(uniques)
 
       self.categories_.append(np.array(uniques))
 
@@ -211,16 +246,26 @@ class CategoricalOrdinalEncoder(BaseEstimator, TransformerMixin):
     return X_out
 
 
-def check_if_datetime_as_object(X: pd.Series) -> bool:
-  """Checks if a pandas Series contains datetime information stored as objects.
+def _looks_like_datetime(X: pd.Series) -> bool:
+  """Checks if a text-typed pandas Series looks like datetime data.
+
+  Considers object- and string-dtype (pandas>=3) columns. Uses a lenient
+  ``errors="coerce"`` parse with a threshold (see below): a column is treated
+  as datetime as long as a meaningful fraction of its values parse as dates,
+  so partially-date columns (dates mixed with some non-date values) are still
+  detected on purpose.
 
   Args:
-    X: A pandas Series whose dtype may or may not be object.
+    X: A pandas Series whose dtype may or may not be object/string.
 
   Returns:
-    True if the series looks like datetime data stored as object dtype.
+    True if the series looks like datetime data stored as text.
   """
-  if not pd.api.types.is_object_dtype(X.dtype):
+  # Accept object dtype and the pandas string dtype (incl. the pyarrow-backed
+  # default in pandas>=3); otherwise date-as-text columns load as 'string',
+  # fail this object-only gate, and silently fall through to categorical.
+  if not (pd.api.types.is_object_dtype(X.dtype)
+          or isinstance(X.dtype, pd.StringDtype)):
     return False
   if X.isnull().all():
     return False
@@ -229,6 +274,12 @@ def check_if_datetime_as_object(X: pd.Series) -> bool:
   except (ValueError, TypeError):
     try:
       if len(X) > 500:
+        # Subsample only to keep the datetime parse-check fast. The fixed seed
+        # is deliberate and independent of the ensemble seed: this is a
+        # type-detection heuristic, so it must not depend on -- or perturb --
+        # the model's random_state (column-type detection must stay stable
+        # across ensemble seeds). A random sample is used over .head() so a
+        # sorted / front-loaded column is still represented.
         X = X.sample(n=500, random_state=0)
       result = pd.to_datetime(X, errors="coerce", format="mixed")
       if result.isnull().mean() > 0.8:
@@ -246,8 +297,8 @@ class DatetimeTransformer(BaseEstimator, TransformerMixin):
   dayofweek) in addition to its Unix-nanosecond integer representation.
   """
 
-  features_in: List[str]
-  _fillna_map: Dict[str, Any]
+  features_in: List[int]
+  _fillna_map: Dict[int, Any]
 
   def __init__(self, features: Optional[List[str]] = None):
     """Initialises the transformer.
@@ -275,10 +326,14 @@ class DatetimeTransformer(BaseEstimator, TransformerMixin):
     """
     if not isinstance(X, pd.DataFrame):
       X = pd.DataFrame(X)
-    self.features_in = list(X.columns)
-    for feature in self.features_in:
-      series = pd.to_datetime(X[feature], utc=True, errors="coerce", format="mixed")
-      self._fillna_map[feature] = series.mean()
+    # Track columns by position: non-string column names would break the
+    # synthetic "<column>.<part>" labels built in transform().
+    self.features_in = list(range(X.shape[1]))
+    for pos in self.features_in:
+      series = pd.to_datetime(
+          X.iloc[:, pos], utc=True, errors="coerce", format="mixed"
+      )
+      self._fillna_map[pos] = series.mean()
     return self
 
   def transform(self, X: Any) -> np.ndarray:
@@ -293,14 +348,18 @@ class DatetimeTransformer(BaseEstimator, TransformerMixin):
     if not isinstance(X, pd.DataFrame):
       X = pd.DataFrame(X)
     X_datetime = pd.DataFrame(index=X.index)
-    for feature in self.features_in:
-      series = pd.to_datetime(X[feature].copy(), utc=True, errors="coerce", format="mixed")
-      broken_idx = series[(series == "NaT") | series.isna() | series.isnull()].index
+    for pos in self.features_in:
+      series = pd.to_datetime(
+          X.iloc[:, pos].copy(), utc=True, errors="coerce", format="mixed"
+      )
+      broken_idx = series[
+          (series == "NaT") | series.isna() | series.isnull()
+      ].index
       if len(broken_idx) > 0:
-        series.loc[broken_idx] = self._fillna_map[feature]
-      X_datetime[feature] = pd.to_numeric(series)
+        series.loc[broken_idx] = self._fillna_map[pos]
+      X_datetime[f"{pos}"] = pd.to_numeric(series)
       for dt_feature in self.features:
-        X_datetime[feature + "." + dt_feature] = getattr(
+        X_datetime[f"{pos}.{dt_feature}"] = getattr(
             series.dt, dt_feature
         ).astype(np.int64)
     return X_datetime.values
@@ -357,25 +416,33 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
       self.tfm_ = FunctionTransformer()
       return self
 
-    datetime_cols = []
-    cat_cols = []
-    numeric_cols = []
+    if X.columns.duplicated().any():
+      # sklearn's ColumnTransformer rejects duplicate column names; fail fast
+      # here with an actionable message instead of crashing mid-pipeline.
+      raise ValueError(
+          "X contains duplicate column names:"
+          f" {X.columns[X.columns.duplicated()].unique().tolist()}. Rename or"
+          " deduplicate them before fitting, e.g. with"
+          " X.columns = range(X.shape[1])."
+      )
 
-    for col in X.columns:
-      series = X[col]
+    datetime_pos = []
+    cat_pos = []
+    numeric_pos = []
+
+    # Classify columns by position so column labels (which may be ints or
+    # other non-strings) are never used for lookups.
+    for pos in range(X.shape[1]):
+      series = X.iloc[:, pos]
       if pd.api.types.is_datetime64_any_dtype(series.dtype):
-        datetime_cols.append(col)
-      elif check_if_datetime_as_object(series):
-        datetime_cols.append(col)
+        datetime_pos.append(pos)
+      elif _looks_like_datetime(series):
+        datetime_pos.append(pos)
       elif pd.api.types.is_numeric_dtype(series.dtype):
-        numeric_cols.append(col)
+        numeric_pos.append(pos)
       else:
         # fallback to categorical if unknown
-        cat_cols.append(col)
-
-    cat_pos = [X.columns.get_loc(col) for col in cat_cols]
-    numeric_pos = [X.columns.get_loc(col) for col in numeric_cols]
-    datetime_pos = [X.columns.get_loc(col) for col in datetime_cols]
+        cat_pos.append(pos)
 
     self.tfm_ = ColumnTransformer(
         transformers=[
@@ -770,28 +837,6 @@ class RTDLQuantileTransformer(BaseEstimator, TransformerMixin):
     return X + noise_std * rng.standard_normal(X.shape)
 
 
-class RecursionLimitManager:
-  """Context manager to temporarily set the Python recursion limit."""
-
-  def __init__(self, limit: int):
-    """Initialises the manager.
-
-    Args:
-      limit: The temporary recursion limit to use.
-    """
-    self.limit = limit
-    self.original_limit: Optional[int] = None
-
-  def __enter__(self):
-    self.original_limit = sys.getrecursionlimit()
-    sys.setrecursionlimit(self.limit)
-    return self
-
-  def __exit__(self, type, value, traceback):
-    sys.setrecursionlimit(self.original_limit)
-    return False
-
-
 class FeatureShuffler:
   """Generates feature permutations for ensemble creation.
 
@@ -804,23 +849,18 @@ class FeatureShuffler:
   def __init__(
       self,
       n_features: int,
-      method: str = "latin",
-      max_features_for_latin: int = 4000,
+      method: str = "random",
       random_state: Optional[int] = None,
   ):
     """Initialises the shuffler.
 
     Args:
       n_features: Number of features to shuffle.
-      method: Shuffling strategy: ``"latin"``, ``"random"``, ``"shift"``, or
-        ``"none"``.
-      max_features_for_latin: When ``n_features`` exceeds this value, the method
-        falls back from ``"latin"`` to ``"random"``.
+      method: Shuffling strategy: ``"random"`` or ``"none"``.
       random_state: Seed for reproducibility.
     """
     self.n_features = n_features
     self.method = method
-    self.max_features_for_latin = max_features_for_latin
     self.random_state = random_state
     self.rng_ = random.Random(self.random_state)
 
@@ -837,66 +877,27 @@ class FeatureShuffler:
     self.rng_ = random.Random(self.random_state)
     feature_indices = list(range(self.n_features))
 
-    if self.n_features > self.max_features_for_latin and self.method == "latin":
-      method = "random"
-    else:
-      method = self.method
-
-    if method == "none" or n_estimators == 1:
+    if self.method == "none" or n_estimators == 1:
       shuffle_patterns = [feature_indices]
-    elif method == "shift":
-      shuffle_patterns = [
-          feature_indices[-i:] + feature_indices[:-i]
-          for i in range(min(n_estimators, self.n_features))
-      ]
-    elif method == "random":
+    elif self.method == "random":
       if self.n_features <= 5:
-        all_perms = [list(perm) for perm in itertools.permutations(feature_indices)]
-        shuffle_patterns = self.rng_.sample(all_perms, min(n_estimators, len(all_perms)))
+        all_perms = [
+            list(perm) for perm in itertools.permutations(feature_indices)
+        ]
+        shuffle_patterns = self.rng_.sample(
+            all_perms, min(n_estimators, len(all_perms))
+        )
       else:
         shuffle_patterns = [
             self.rng_.sample(feature_indices, self.n_features)
             for _ in range(n_estimators)
         ]
-    elif method == "latin":
-      with RecursionLimitManager(100000):
-        shuffle_patterns = self._latin_squares()
-        if len(shuffle_patterns) > n_estimators:
-          shuffle_patterns = self.rng_.sample(shuffle_patterns, n_estimators)
     else:
       raise ValueError(
-          f"Unknown method: {method}. Use 'shift', 'random', 'latin', or 'none'."
+          f"Unknown method: {self.method}. Use 'random' or 'none'."
       )
 
     return [np.array(p) for p in shuffle_patterns]
-
-  def _latin_squares(self) -> List[List[int]]:
-    """Generates a random Latin square as a list of row permutations."""
-
-    def _shuffle_transpose_shuffle(matrix):
-      square = deepcopy(matrix)
-      self.rng_.shuffle(square)
-      trans = list(zip(*square))
-      self.rng_.shuffle(trans)
-      return trans
-
-    def _rls(symbols):
-      n = len(symbols)
-      if n == 1:
-        return [symbols]
-      sym = self.rng_.choice(symbols)
-      symbols_copy = list(symbols)
-      symbols_copy.remove(sym)
-      square = _rls(symbols_copy)
-      square.append(list(square[0]))
-      for i in range(n):
-        square[i].insert(i, sym)
-      return square
-
-    symbols = list(range(self.n_features))
-    square = _rls(symbols)
-    feature_shuffles = _shuffle_transpose_shuffle(square)
-    return [list(shuffle) for shuffle in feature_shuffles]
 
 
 class PreprocessingPipeline(TransformerMixin, BaseEstimator):
@@ -1043,8 +1044,24 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     feature_shuffle_patterns_: Ordered dict mapping norm method -> shuffle
       patterns.
     class_shift_offsets_: Ordered dict mapping norm method -> shift offsets.
-    cat_permutations_: Ordered dict mapping norm method -> cat permutation dicts.
+    cat_permutations_: Ordered dict mapping norm method -> cat permutation
+      dicts.
+    row_subsample_patterns_: Ordered dict mapping norm method -> row subsample
+      patterns (used for max_num_rows).
     preprocessors_: Fitted ``PreprocessingPipeline`` per norm method.
+    unique_filter_: Fitted ``UniqueFeatureFilter`` used to remove duplicate or
+      constant features.
+    n_original_features_: Number of input features before feature augmentation
+      crosses or SVD.
+    cross_pairs_: List of feature index pairs generated for feature crosses.
+    cross_pool_start_: Starting column index in ``X_`` for the feature crosses
+      pool.
+    cross_pool_end_: Ending column index in ``X_`` for the feature crosses pool.
+    svd_pipeline_: Fitted SVD pipeline used to generate SVD structural features.
+    svd_pool_start_: Starting column index in ``X_`` for the SVD features pool.
+    svd_pool_end_: Ending column index in ``X_`` for the SVD features pool.
+    k_crosses_list_: List of feature cross counts to sample per ensemble member.
+    k_svd_list_: List of SVD feature counts to sample per ensemble member.
   """
 
   norm_methods_: List[str]
@@ -1059,17 +1076,34 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
   feature_shuffle_patterns_: collections.OrderedDict
   class_shift_offsets_: collections.OrderedDict
   cat_permutations_: collections.OrderedDict
+  row_subsample_patterns_: collections.OrderedDict
   preprocessors_: Dict[str, PreprocessingPipeline]
+  unique_filter_: UniqueFeatureFilter
+  n_original_features_: int
+  cross_pairs_: List[Any]
+  cross_pool_start_: int
+  cross_pool_end_: int
+  svd_pipeline_: Any
+  svd_pool_start_: int
+  svd_pool_end_: int
+  k_crosses_list_: List[int]
+  k_svd_list_: List[int]
 
   def __init__(
       self,
       n_estimators: int,
       norm_methods: Union[str, List[str], None] = None,
-      feat_shuffle_method: str = "latin",
+      feat_shuffle_method: str = "random",
       class_shift: bool = True,
       cat_features: Optional[List[int]] = None,
       permute_categorical: bool = False,
       outlier_threshold: float = 4.0,
+      max_num_features: Optional[int] = 500,
+      max_num_rows: Optional[int] = None,
+      n_feature_crosses: Union[int, str] = 0,
+      n_svd_features: Union[int, str] = 0,
+      feature_allocation: str = "split",
+      total_svd_pool: Optional[int] = None,
       random_state: Optional[int] = None,
       task: str = "classification",
   ):
@@ -1079,15 +1113,26 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
       n_estimators: Number of ensemble members to generate.
       norm_methods: Normalization method(s) to use. If ``None``, defaults to
         ``["none", "power"]``. May be a single string or a list.
-      feat_shuffle_method: Feature-permutation strategy (``"latin"``,
-        ``"random"``, ``"shift"``, or ``"none"``).
+      feat_shuffle_method: Feature-permutation strategy (``"random"`` or
+        ``"none"``).
       class_shift: Whether to apply random class-label shifts (classification
         only).
       cat_features: Indices of categorical features in the *encoded* input.
       permute_categorical: Whether to randomly permute categorical values across
         ensemble members.
       outlier_threshold: Z-score threshold forwarded to``OutlierRemover``.
-      random_state: Seed for reproducibility.
+      max_num_features: Maximum number of features to subsample per ensemble
+        member.
+      max_num_rows: Maximum number of rows to subsample per ensemble member.
+      n_feature_crosses: ``"sqrt"`` to add sqrt(n_features) random feature
+        crosses per ensemble member, or ``0`` to disable.
+      n_svd_features: ``"sqrt"`` to add sqrt(n_features) random SVD features per
+        ensemble member, or ``0`` to disable.
+      feature_allocation: ``"split"`` alternates augmented / non-augmented
+        members (the default ensemble diversity); ``"all"`` gives every member
+        the full feature-cross / SVD augmentation (use with ``n_estimators=1``
+        to build a single self-contained augmented view).
+      total_svd_pool: Total pool size of SVD features to generate.
       task: Either ``"classification"`` or ``"regression"``.
     """
     self.n_estimators = n_estimators
@@ -1097,8 +1142,47 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     self.cat_features = cat_features
     self.permute_categorical = permute_categorical
     self.outlier_threshold = outlier_threshold
+    self.max_num_features = max_num_features
+    self.max_num_rows = max_num_rows
+    self.n_feature_crosses = n_feature_crosses
+    self.n_svd_features = n_svd_features
+    self.feature_allocation = feature_allocation
+    self.total_svd_pool = total_svd_pool
     self.random_state = random_state
     self.task = task
+
+  def _get_n_features_to_add(
+      self, n_features_requested: Union[int, str, None], n_cols: int
+  ) -> int:
+    if n_features_requested in (0, None):
+      return 0
+    if (
+        isinstance(n_features_requested, str)
+        and n_features_requested.lower() == "sqrt"
+    ):
+      return max(1, int(np.sqrt(n_cols)))
+    raise ValueError(
+        f"Invalid requested number of features: {n_features_requested!r}."
+        " Expected 0 (disabled) or 'sqrt'."
+    )
+
+  def _get_member_n_features_list(
+      self, n_features_requested: Any, n_cols: int
+  ) -> List[int]:
+    """Resolves the number of features to add for each ensemble member.
+
+    ``feature_allocation`` selects the pattern:
+      * ``"split"`` (default): even-indexed members get no added features while
+        odd-indexed members get the full ``k_max`` -- a diverse mix of augmented
+        and non-augmented views within one ensemble.
+      * ``"all"``: every member gets the full ``k_max``. Use this to build a
+        single self-contained augmented view (``n_estimators=1``), e.g. when the
+        ensembling is done outside this estimator.
+    """
+    k_max = self._get_n_features_to_add(n_features_requested, n_cols)
+    if self.feature_allocation == "all":
+      return [k_max for _ in range(self.n_estimators)]
+    return [0 if i % 2 == 0 else k_max for i in range(self.n_estimators)]
 
   def fit(self, X: Any, y: Any) -> "EnsembleGenerator":
     """Fit the ensemble generator to training data.
@@ -1130,10 +1214,104 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
       # Filter
       mask = mask[self.unique_filter_.features_to_keep_]
       self.cat_features_ = np.where(mask)[0]
-      self.cat_values_ = {idx: np.unique(X[:, idx]) for idx in self.cat_features_}
+      self.cat_values_ = {
+          idx: np.unique(X[:, idx]) for idx in self.cat_features_
+      }
     else:
-      self.cat_features_ = np.array([])
+      self.cat_features_ = np.array([], dtype=np.int64)
       self.cat_values_ = {}
+
+    self.rng_ = random.Random(self.random_state)
+
+    n_original_features = X.shape[1]
+    self.n_original_features_ = n_original_features
+    current_idx = n_original_features
+
+    n_cols_expected = n_original_features
+    if self.max_num_features is not None:
+      n_cols_expected = min(n_cols_expected, self.max_num_features)
+
+    self.k_crosses_list_ = self._get_member_n_features_list(
+        self.n_feature_crosses, n_cols_expected
+    )
+    self.k_svd_list_ = self._get_member_n_features_list(
+        self.n_svd_features, n_cols_expected
+    )
+
+    if sum(self.k_crosses_list_) > 0:
+      num_features = [
+          i for i in range(n_original_features) if i not in self.cat_features_
+      ]
+      if len(num_features) >= 2:
+        max_possible_pairs = len(num_features) * (len(num_features) - 1) // 2
+        pool_size = min(sum(self.k_crosses_list_), max_possible_pairs)
+
+        if max_possible_pairs <= pool_size:
+          self.cross_pairs_ = list(itertools.combinations(num_features, 2))
+        else:
+          # Combinatorial unranking to sample uniformly from combinations.
+          # Uses combinadics representation to map an integer to a combination.
+          # Idea: assume ordering (0,1); (0,2); (1,2); (0,3); ...
+          # There are j(j-1)/2 elements before (0,j).
+          # Need largest j such that j(j-1)/2 <= m; solve w/ quadratic formula.
+          # Compute residual to get index i within the j-th block.
+          sampled_indices = self.rng_.sample(
+              range(max_possible_pairs), pool_size
+          )
+          self.cross_pairs_ = []
+          for m in sampled_indices:
+            j = (1 + math.isqrt(1 + 8 * m)) // 2
+            i = m - j * (j - 1) // 2
+            self.cross_pairs_.append((num_features[i], num_features[j]))
+
+        X = _append_cross_features(X, self.cross_pairs_)
+
+        self.cross_pool_start_ = current_idx
+        self.cross_pool_end_ = X.shape[1]
+        current_idx = X.shape[1]
+
+    if sum(self.k_svd_list_) > 0:
+      transformers = []
+      if len(self.cat_features_) > 0:
+        transformers.append((
+            "cat",
+            OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+            self.cat_features_,
+        ))
+      num_features = [
+          i for i in range(n_original_features) if i not in self.cat_features_
+      ]
+      if num_features:
+        transformers.append(("num", StandardScaler(), num_features))
+
+      if transformers:
+        preprocessor = ColumnTransformer(transformers)
+        X_prep = preprocessor.fit_transform(X[:, :n_original_features])
+        n_features_prep = X_prep.shape[1]
+        n_samples = X.shape[0]
+        max_possible_svd = min(n_samples, n_features_prep) - 1
+
+        pool_size = self.total_svd_pool
+        if pool_size is None:
+          pool_size = sum(self.k_svd_list_)
+        pool_size = min(pool_size, max_possible_svd)
+
+        if pool_size > 0:
+          self.svd_pipeline_ = Pipeline([
+              ("prep", preprocessor),
+              (
+                  "svd",
+                  TruncatedSVD(
+                      n_components=pool_size, random_state=self.random_state
+                  ),
+              ),
+          ])
+          X = _append_svd_features(
+              X, n_original_features, self.svd_pipeline_, is_train=True
+          )
+
+          self.svd_pool_start_ = current_idx
+          self.svd_pool_end_ = X.shape[1]
 
     self.X_ = X
     self.y_ = y
@@ -1143,14 +1321,13 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     else:
       self.n_classes_ = 0
 
-    self.rng_ = random.Random(self.random_state)
-
     # Generate and unpack all ensemble components
     (
         self.ensemble_configs_,
         self.feature_shuffle_patterns_,
         self.class_shift_offsets_,
         self.cat_permutations_,
+        self.row_subsample_patterns_,
     ) = self._generate_ensemble()
 
     self.preprocessors_ = {}
@@ -1173,27 +1350,66 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
       collections.OrderedDict,
       collections.OrderedDict,
       collections.OrderedDict,
+      collections.OrderedDict,
   ]:
     """Create diverse ensemble configurations grouped by normalization method.
 
     Returns:
-      A 4-tuple of OrderedDicts:
+      A 5-tuple of OrderedDicts:
         (ensemble_configs, feature_shuffle_patterns, class_shift_offsets,
-         cat_permutations_grouped).
+         cat_permutations_grouped, row_subsample_patterns_grouped).
     """
-    shuffler = FeatureShuffler(
-        n_features=self.n_features_in_,
-        method=self.feat_shuffle_method,
-        random_state=self.random_state,
-    )
-    shuffle_patterns = shuffler.shuffle(self.n_estimators)
+    n_cols = self.n_original_features_
+    if self.max_num_features is not None:
+      n_cols = min(n_cols, self.max_num_features)
 
-    # Ensure shuffle_patterns matches n_estimators (FeatureShuffler might return fewer)
-    if len(shuffle_patterns) < self.n_estimators:
-      num_cycles = (
-          self.n_estimators + len(shuffle_patterns) - 1
-      ) // len(shuffle_patterns)
-      shuffle_patterns = (shuffle_patterns * num_cycles)[: self.n_estimators]
+    any_crosses = any(k > 0 for k in self.k_crosses_list_) and hasattr(
+        self, "cross_pairs_"
+    )
+    any_svd = any(k > 0 for k in self.k_svd_list_) and hasattr(
+        self, "svd_pipeline_"
+    )
+
+    is_subsampling = n_cols < self.n_original_features_
+    if any_crosses or any_svd or is_subsampling:
+      shuffle_patterns = []
+      for idx in range(self.n_estimators):
+        # Subsample original features matching max_num_features
+        cols = self.rng_.sample(range(self.n_original_features_), n_cols)
+
+        k_cross = self.k_crosses_list_[idx]
+        if k_cross > 0 and hasattr(self, "cross_pool_start_"):
+          pool_start = self.cross_pool_start_
+          pool_end = self.cross_pool_end_
+          pool_size = pool_end - pool_start
+          k = min(k_cross, pool_size)
+          selected_crosses = self.rng_.sample(range(pool_start, pool_end), k)
+          cols.extend(selected_crosses)
+
+        k_svd = self.k_svd_list_[idx]
+        if k_svd > 0 and hasattr(self, "svd_pool_start_"):
+          pool_start = self.svd_pool_start_
+          pool_end = self.svd_pool_end_
+          pool_size = pool_end - pool_start
+          k = min(k_svd, pool_size)
+          selected_svd = self.rng_.sample(range(pool_start, pool_end), k)
+          cols.extend(selected_svd)
+
+        shuffle_pattern = np.array(self.rng_.sample(cols, len(cols)))
+        shuffle_patterns.append(shuffle_pattern)
+    else:
+      shuffler = FeatureShuffler(
+          n_features=self.n_features_in_,
+          method=self.feat_shuffle_method,
+          random_state=self.random_state,
+      )
+      shuffle_patterns = shuffler.shuffle(self.n_estimators)
+
+      if len(shuffle_patterns) < self.n_estimators:
+        num_cycles = (self.n_estimators + len(shuffle_patterns) - 1) // len(
+            shuffle_patterns
+        )
+        shuffle_patterns = (shuffle_patterns * num_cycles)[: self.n_estimators]
 
     # 2. Generate Class Shifts
     if (
@@ -1224,13 +1440,31 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     else:
       cat_permutations = [None] * self.n_estimators
 
-    # 4. Combine into configurations
+    # 4. Generate Row Subsample Patterns
+    n_rows = self.X_.shape[0]
+    if self.max_num_rows is not None:
+      n_rows = min(n_rows, self.max_num_rows)
+
+    if n_rows < self.X_.shape[0]:
+      row_subsample_patterns = [
+          np.array(self.rng_.sample(range(self.X_.shape[0]), n_rows))
+          for _ in range(self.n_estimators)
+      ]
+    else:
+      row_subsample_patterns = [None] * self.n_estimators
+
+    # 5. Combine into configurations
     shuffle_shift_cat_configs = list(
-        zip(shuffle_patterns, shift_offsets, cat_permutations)
+        zip(
+            shuffle_patterns,
+            shift_offsets,
+            cat_permutations,
+            row_subsample_patterns,
+        )
     )
     self.rng_.shuffle(shuffle_shift_cat_configs)
 
-    # 5. Assign Normalization Methods
+    # 6. Assign Normalization Methods
     num_cycles = (
         self.n_estimators + len(self.norm_methods_) - 1
     ) // len(self.norm_methods_)
@@ -1242,6 +1476,9 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     feature_shuffle_patterns: collections.OrderedDict = collections.OrderedDict()
     class_shift_offsets_dict: collections.OrderedDict = collections.OrderedDict()
     cat_permutations_grouped: collections.OrderedDict = collections.OrderedDict()
+    row_subsample_patterns_grouped: collections.OrderedDict = (
+        collections.OrderedDict()
+    )
 
     for norm_method in self.norm_methods_:
       configs = [config for norm, config in full_configs if norm == norm_method]
@@ -1250,12 +1487,14 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
         feature_shuffle_patterns[norm_method] = [c[0] for c in configs]
         class_shift_offsets_dict[norm_method] = [c[1] for c in configs]
         cat_permutations_grouped[norm_method] = [c[2] for c in configs]
+        row_subsample_patterns_grouped[norm_method] = [c[3] for c in configs]
 
     return (
         ensemble_configs,
         feature_shuffle_patterns,
         class_shift_offsets_dict,
         cat_permutations_grouped,
+        row_subsample_patterns_grouped,
     )
 
   def transform(self, X: Any) -> collections.OrderedDict:
@@ -1272,54 +1511,191 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
     """
     check_is_fitted(self, ["ensemble_configs_"])
     X = self.unique_filter_.transform(X)
+
+    if hasattr(self, "cross_pairs_") and self.cross_pairs_:
+      X = _append_cross_features(X, self.cross_pairs_)
+
+    if hasattr(self, "svd_pipeline_") and self.svd_pipeline_:
+      X = _append_svd_features(
+          X, self.n_original_features_, self.svd_pipeline_, is_train=False
+      )
+
+    data, _ = self._transform_features(X_test=X)
+    return data
+
+  def transform_fold(
+      self, train_fold: np.ndarray, val_fold: np.ndarray
+  ) -> Tuple[collections.OrderedDict, List[np.ndarray]]:
+    """Generate ensemble data views for a fold-based split of training data.
+
+    Args:
+      train_fold: 1D array of training row indices (relative to row subsample).
+      val_fold: 1D array of validation row indices (relative to row subsample).
+
+    Returns:
+      A tuple containing:
+        - data: Ordered dictionary mapping normalization string keys to
+          (X_ensemble, y_ensemble) arrays formatted identically to transform().
+        - val_indices_list: List of absolute sample indices in the training set
+          corresponding to validation query rows for each ensemble member.
+          For example, if our row subsample for member i is [0, 2, 4, 6, 8] and
+          our val_fold is [1, 3], then the ith element of val_indices_list will
+          be [2, 6].
+    """
+    return self._transform_features(
+        X_test=None, train_fold=train_fold, val_fold=val_fold
+    )
+
+  def _transform_features(
+      self,
+      X_test: Optional[np.ndarray],
+      train_fold: Optional[np.ndarray] = None,
+      val_fold: Optional[np.ndarray] = None,
+  ) -> Tuple[collections.OrderedDict, List[np.ndarray]]:
+    """Shared helper to construct transformed feature and target dictionaries.
+
+    Handles feature formatting, categorical value permutations, scaling, and
+    padding for both standard test inference (transform) and out-of-fold
+    cross-validation (transform_fold).
+
+    Args:
+      X_test: 2D feature array of test queries of shape (n_samples, n_features).
+        If None, the evaluation test queries are taken from self.X_[val_fold]
+        during cross-validation.
+      train_fold: Optional array of indices selecting in-context training rows
+        during cross-validation. If None, all active training rows are used.
+      val_fold: Optional array of indices selecting evaluation validation rows
+        during cross-validation.
+
+    Returns:
+      A tuple containing:
+        - data: Ordered dictionary mapping normalization keys to transformed
+          feature and target batches.
+        - val_indices_list: List of absolute validation row indices per config.
+    """
     y = self.y_
+    N = len(y)
+
+    # Find max_features across all ensemble configs so that we can pad all
+    # feature matrices to this width to feed a regular tensor into the model.
+    max_features = 0
+    for (
+        norm_method,
+        shuffle_shift_cat_configs,
+    ) in self.ensemble_configs_.items():
+      for shuffle_pattern, _, _, _ in shuffle_shift_cat_configs:
+        max_features = max(max_features, len(shuffle_pattern))
 
     data: collections.OrderedDict = collections.OrderedDict()
-    for norm_method, shuffle_shift_cat_configs in self.ensemble_configs_.items():
+    val_indices_list = []
+
+    for (
+        norm_method,
+        shuffle_shift_cat_configs,
+    ) in self.ensemble_configs_.items():
       preprocessor = self.preprocessors_[norm_method]
       X_ensemble = []
       y_ensemble = []
 
-      for shuffle_pattern, shift_offset, cat_perm in shuffle_shift_cat_configs:
+      for (
+          shuffle_pattern,
+          shift_offset,
+          cat_perm,
+          row_sub_pattern,
+      ) in shuffle_shift_cat_configs:
+        in_bag_idx = (
+            row_sub_pattern if row_sub_pattern is not None else np.arange(N)
+        )
+
+        if train_fold is not None and val_fold is not None:
+          train_idx = in_bag_idx[train_fold]
+          val_idx = in_bag_idx[val_fold]
+          val_indices_list.append(val_idx)
+        else:
+          train_idx = in_bag_idx
+          val_idx = None
+
+        y_to_use = y[train_idx]
         if cat_perm:
           # If we have categorical permutations, we must apply them before preprocessing
-          # Note: self.X_ is the fitted training data. X is the test data.
-
+          # Note: self.X_ is the fitted training data. X_test is the test data.
           # We need to construct the full dataset (Train + Test)
-          X_full = np.concatenate([self.X_, X], axis=0)
+          X_train_to_use = self.X_[train_idx]
+          X_test_to_use = self.X_[val_idx] if val_idx is not None else X_test
+          X_full = np.concatenate([X_train_to_use, X_test_to_use], axis=0)
 
           # Apply value permutation
-          for col, mapping in cat_perm.items():
-            col_vals = X_full[:, col]
-            u_vals, inverse = np.unique(col_vals, return_inverse=True)
-            mapped_u_vals = u_vals.copy()
-            for i, val in enumerate(u_vals):
-              if val in mapping:
-                mapped_u_vals[i] = mapping[val]
-            X_full[:, col] = mapped_u_vals[inverse]
+          _apply_categorical_permutation(X_full, cat_perm)
           X_variant_instance = preprocessor.transform(X_full)
         else:
-          X_train_trans = getattr(
-              preprocessor, "X_transformed_", preprocessor.transform(self.X_)
+          X_train_trans = preprocessor.X_transformed_[train_idx]
+          X_test_trans = (
+              preprocessor.X_transformed_[val_idx]
+              if val_idx is not None
+              else preprocessor.transform(X_test)
           )
-          X_test_trans = preprocessor.transform(X)
-          X_variant_instance = np.concatenate([X_train_trans, X_test_trans], axis=0)
+          X_variant_instance = np.concatenate(
+              [X_train_trans, X_test_trans], axis=0
+          )
 
         # Apply feature shuffling
-        X_ensemble.append(X_variant_instance[:, shuffle_pattern])
+        shuffled_cols = X_variant_instance[:, shuffle_pattern]
+        shuffled_cols = _pad_features(shuffled_cols, max_features)
+        X_ensemble.append(shuffled_cols)
 
         # Apply class shifting
         if self.task == "classification":
-          y_ensemble.append((y + shift_offset) % self.n_classes_)
+          y_ensemble.append((y_to_use + shift_offset) % self.n_classes_)
         else:
-          y_ensemble.append(y)
+          y_ensemble.append(y_to_use)
 
       data[norm_method] = (
           np.stack(X_ensemble, axis=0),
           np.stack(y_ensemble, axis=0),
       )
 
-    return data
+    return data, val_indices_list
+
+  def prepare_ensemble_tensors(
+      self, data: collections.OrderedDict
+  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Any]]:
+    """Prepare batched ensemble tensors and flat configs from transformed data.
+
+    Args:
+      data: Ordered dictionary mapping normalization string keys to (Xs, ys)
+        sequence tensors (e.g., returned by transform() or transform_fold()).
+
+    Returns:
+      Tuple containing:
+        - Xs_all: Concatenated feature array across all ensemble configs.
+        - ys_all: Concatenated array of sequence target labels.
+        - cat_masks_all: Stacked boolean masks indicating categorical indices.
+        - ds_all: Array indicating sequence lengths per config.
+        - configs_flat: Flattened list of ensemble config tuples.
+    """
+    max_features = max(Xs.shape[-1] for _, (Xs, _) in data.items())
+    Xs_all, ys_all, cat_masks_all, ds_all = [], [], [], []
+    configs_flat = []
+
+    for norm_method, (Xs, ys) in data.items():
+      Xs_all.append(Xs)
+      ys_all.append(ys)
+      configs = self.ensemble_configs_[norm_method]
+      for config in configs:
+        configs_flat.append(config)
+        shuffle_pattern, _, _, _ = config
+        mask = np.zeros(self.n_features_in_, dtype=np.bool_)
+        if hasattr(self, "cat_features_"):
+          mask[self.cat_features_] = True
+        ds_all.append(len(shuffle_pattern))
+        cat_mask = _pad_cat_mask(mask[shuffle_pattern], max_features)
+        cat_masks_all.append(cat_mask)
+
+    Xs_all = np.concatenate(Xs_all, axis=0)
+    ys_all = np.concatenate(ys_all, axis=0)
+    cat_masks_all = np.stack(cat_masks_all, axis=0)
+    ds_all = np.array(ds_all, dtype=np.int32)
+    return Xs_all, ys_all, cat_masks_all, ds_all, configs_flat
 
 
 # ---------------------------------------------------------------------------
@@ -1327,15 +1703,67 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
 # ---------------------------------------------------------------------------
 
 
+def _apply_categorical_permutation(
+    X_full: np.ndarray, cat_perm: Dict[int, Dict[Any, Any]]
+) -> None:
+  """Apply value permutations to categorical features in place.
+
+  Args:
+    X_full: 2D array of shape (n_samples, n_features) whose categorical columns
+      will be permuted in place.
+    cat_perm: Dictionary mapping categorical column indices to category value
+      replacement mappings (e.g. ``{col_idx: {old_val: new_val}}``).
+  """
+  for col, mapping in cat_perm.items():
+    col_vals = X_full[:, col]
+    u_vals, inverse = np.unique(col_vals, return_inverse=True)
+    mapped_u_vals = u_vals.copy()
+    for i, val in enumerate(u_vals):
+      if val in mapping:
+        mapped_u_vals[i] = mapping[val]
+    X_full[:, col] = mapped_u_vals[inverse]
+
+
+def _append_cross_features(
+    X: np.ndarray, cross_pairs: List[Tuple[int, int]]
+) -> np.ndarray:
+  """Append multiplicative feature crosses to feature matrix X along axis 1."""
+  if not cross_pairs:
+    return X
+  new_cols = [X[:, i] * X[:, j] for i, j in cross_pairs]
+  return np.concatenate([X, np.stack(new_cols, axis=1)], axis=1)
+
+
+def _append_svd_features(
+    X: np.ndarray,
+    n_original_features: int,
+    svd_pipeline: Optional[Pipeline],
+    is_train: bool = False,
+) -> np.ndarray:
+  """Append TruncatedSVD components to feature matrix X along axis 1."""
+  if not svd_pipeline:
+    return X
+  X_orig = X[:, :n_original_features]
+  svd_feats = (
+      svd_pipeline.fit_transform(X_orig)
+      if is_train
+      else svd_pipeline.transform(X_orig)
+  )
+  return np.concatenate([X, svd_feats], axis=1)
+
+
 @jt.typed
 def _pad_batch_to_multiple_of(
-    x: jax.Array | np.ndarray, divisor: int
-) -> jax.Array | np.ndarray:
+    x: Array | np.ndarray,
+    divisor: int,
+    constant_value: Union[int, float, np.number] = 0,
+) -> Array | np.ndarray:
   """Pad axis 0 of array (at the end) to a multiple of ``divisor``.
 
   Args:
     x: Input array of any shape.
     divisor: Target multiple for axis 0.
+    constant_value: Value to pad with. Defaults to 0.
 
   Returns:
     Array whose first dimension is the smallest multiple of ``divisor`` that
@@ -1348,7 +1776,193 @@ def _pad_batch_to_multiple_of(
   if pad_size == 0:
     return x
   pad_width = ((0, pad_size),) + ((0, 0),) * (x.ndim - 1)
-  return np.pad(x, pad_width, constant_values=0)
+  return np.pad(x, pad_width, constant_values=constant_value)
+
+
+def _pad_features(X: np.ndarray, target_features: int) -> np.ndarray:
+  """Pad a 2D feature matrix X along axis 1 (columns) to target_features with zeros."""
+  if X.shape[1] < target_features:
+    pad_cols = target_features - X.shape[1]
+    return np.pad(X, ((0, 0), (0, pad_cols)), constant_values=0)
+  return X
+
+
+def _pad_cat_mask(cat_mask: np.ndarray, target_features: int) -> np.ndarray:
+  """Pad a 1D categorical mask array to target_features with False entries."""
+  if cat_mask.shape[0] < target_features:
+    pad_cols = target_features - cat_mask.shape[0]
+    return np.pad(cat_mask, (0, pad_cols), constant_values=False)
+  return cat_mask
+
+
+def _predict_step_pytorch(
+    model: Any,
+    X_batch: np.ndarray,
+    y_batch: np.ndarray,
+    train_size_val: int,
+    ds_batch_val: Optional[np.ndarray],
+    cat_mask_batch: Optional[np.ndarray],
+) -> np.ndarray:
+  """Runs PyTorch forward pass and returns numpy array."""
+  if not HAS_TORCH:
+    raise ImportError("PyTorch is required to run a PyTorch model.")
+
+  device = next(model.parameters()).device
+
+  X_t = torch.from_numpy(X_batch).to(device, dtype=torch.float32)
+  y_t = torch.from_numpy(y_batch).to(device)
+  if y_t.dtype == torch.float64:
+    y_t = y_t.to(torch.float32)
+
+  batch_size = X_batch.shape[0]
+  train_size_t = torch.full(
+      (batch_size,), train_size_val, dtype=torch.long, device=device
+  )
+
+  if ds_batch_val is not None:
+    d_t = torch.from_numpy(ds_batch_val).to(device)
+  else:
+    d_t = torch.full(
+        (batch_size,), X_batch.shape[-1], dtype=torch.long, device=device
+    )
+
+  cat_mask_t = (
+      torch.from_numpy(cat_mask_batch).to(device)
+      if cat_mask_batch is not None
+      else None
+  )
+
+  with torch.no_grad():
+    out_t = model(X_t, y_t, train_size_t, cat_mask=cat_mask_t, d=d_t)
+
+  return out_t.float().cpu().numpy()  # upcast: numpy has no bfloat16
+
+
+# Compiled predict step functions memoized on the estimators by
+# _batch_forward. They close over nnx.jit state and cannot be pickled.
+_COMPILED_PREDICT_CACHE_ATTRS = (
+    "_predict_step_compiled_with_cat",
+    "_predict_step_compiled_no_cat",
+)
+def _check_classifier_output_dim(output_dim: int, n_classes: int) -> None:
+  """Validates that the model produces logits for all target classes.
+
+  Args:
+    output_dim: Size of the model output's last axis.
+    n_classes: Number of classes seen during fit.
+
+  Raises:
+    ValueError: If the model outputs fewer values per row than there are
+      classes, which usually means a regression checkpoint is being used for
+      classification.
+  """
+  if output_dim < n_classes:
+    raise ValueError(
+        f"The model returned {output_dim} value(s) per row, but this"
+        f" TabFMClassifier was fit on {n_classes} classes. This usually means"
+        " a regression checkpoint is being used for classification. Load the"
+        " classification weights instead, e.g."
+        " `tabfm_v1_0_0.load(model_type='classification')`."
+    )
+
+
+def _check_regressor_output_dim(output_dim: int) -> None:
+  """Validates that the model produces scalar regression outputs.
+
+  Args:
+    output_dim: Size of the model output's last axis.
+
+  Raises:
+    ValueError: If the model outputs more than one value per row, which
+      usually means a classification checkpoint is being used for regression.
+  """
+  if output_dim != 1:
+    raise ValueError(
+        f"The model returned {output_dim} values per row, but TabFMRegressor"
+        " expects a single regression output. This usually means a"
+        " classification checkpoint is being used for regression; note that"
+        " `tabfm_v1_0_0.load()` defaults to the classification weights. Load"
+        " the regression weights instead with"
+        " `tabfm_v1_0_0.load(model_type='regression')`."
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# Ensemble weighting
+# ---------------------------------------------------------------------------
+
+
+def greedy_ensemble_selection(
+    predictions: np.ndarray,
+    error_fn: Any,
+    rounds: int = 25,
+    renormalize: bool = False,
+    random_state: Optional[int] = None,
+) -> np.ndarray:
+  """Computes ensemble weights via greedy forward selection with replacement.
+
+  Implements the ensemble-selection algorithm of Caruana et al. (2004) as used
+  by AutoGluon's weighted ensemble (the TabArena reference setup): starting
+  from an empty ensemble, each round adds the member (with replacement) whose
+  inclusion minimizes the error of the running ensemble mean.  Ties prefer
+  members already selected (keeps the ensemble small), then break randomly.
+  The selection trajectory is truncated at its error minimum ("use best"), and
+  each member's final weight is its selection count, normalized to sum to one.
+
+  Args:
+    predictions: Out-of-fold predictions per ensemble member, of shape
+      ``(n_estimators, n_samples)`` for regression or
+      ``(n_estimators, n_samples, n_classes)`` for classification.
+    error_fn: Callable mapping an ensemble prediction (same shape as one
+      member's predictions) to a scalar error to minimize, e.g. RMSE against
+      the training targets or log-loss.
+    rounds: Number of greedy selection rounds.  Defaults to 25, matching
+      AutoGluon (per TabRepo, larger values give no measurable improvement).
+    renormalize: Whether to renormalize candidate ensemble predictions to sum
+      to one along the last axis before scoring (for class probabilities).
+    random_state: Seed for random tie-breaking.
+
+  Returns:
+    np.ndarray of shape (n_estimators,) with non-negative weights summing to 1.
+  """
+  predictions = np.asarray(predictions)
+  n_estimators = predictions.shape[0]
+  rng = np.random.RandomState(random_state)
+
+  order = []
+  trajectory = []
+  ensemble_sum = np.zeros(predictions.shape[1:])
+  for _ in range(rounds):
+    s = len(order)
+    scores = np.zeros(n_estimators)
+    for j in range(n_estimators):
+      candidate = (ensemble_sum + predictions[j]) / float(s + 1)
+      if renormalize:
+        denom = candidate.sum(axis=-1, keepdims=True)
+        candidate = candidate / np.where(denom == 0, 1.0, denom)
+      scores[j] = error_fn(candidate)
+    best_score = np.nanmin(scores)
+    all_best = np.flatnonzero(
+        np.isclose(scores, best_score, atol=0, rtol=1e-12)
+    )
+    if len(all_best) > 1 and order:
+      already_used = [j for j in all_best if j in order]
+      if already_used:
+        all_best = np.asarray(already_used)
+    order.append(int(rng.choice(all_best)))
+    trajectory.append(scores[order[-1]])
+    ensemble_sum += predictions[order[-1]]
+    if n_estimators == 1:
+      break
+
+  # Truncate the trajectory at its error minimum ("use best" in AutoGluon).
+  order = order[: int(np.argmin(trajectory)) + 1]
+
+  weights = np.zeros(n_estimators)
+  for j in order:
+    weights[j] += 1.0
+  return weights / np.sum(weights)
 
 
 # ---------------------------------------------------------------------------
@@ -1371,6 +1985,12 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     n_classes_: Number of unique classes.
     X_encoder_: Fitted ``TransformToNumerical`` for input features.
     ensemble_generator_: Fitted ``EnsembleGenerator``.
+    active_calibration_method_: Resolved calibration method name ("platt" for
+      binary, "vector" for multiclass, or None).
+    ensemble_weights_: Blending weights for ensemble members, computed via
+      NNLS or greedy ensemble selection.
+    calibration_lambda: L2 regularization strength for calibration parameter
+      scaling.
   """
 
   y_encoder_: CategoricalOrdinalEncoder
@@ -1378,30 +1998,47 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
   n_classes_: int
   X_encoder_: TransformToNumerical
   ensemble_generator_: EnsembleGenerator
+  active_calibration_method_: Optional[str]
+  ensemble_weights_: np.ndarray
+  calibration_lambda: float
 
   def __init__(
       self,
       model: Any,
-      config: Optional[Union[argparse.Namespace, flags.FlagValues]] = None,
       n_estimators: int = 32,
       norm_methods: Optional[Union[str, List[str]]] = None,
-      feat_shuffle_method: str = "latin",
+      feat_shuffle_method: str = "random",
       class_shift: bool = True,
       permute_categorical: bool = False,
       outlier_threshold: float = 4.0,
+      max_num_features: Optional[int] = 500,
+      max_num_rows: Optional[int] = None,
       softmax_temperature: float = 0.9,
       average_logits: bool = True,
       use_amp: bool = True,
       batch_size: Optional[int] = 1,
-      random_state: Optional[int] = 42,
+      random_state: Optional[int] = _DEFAULT_RANDOM_STATE,
       verbose: bool = False,
       cat_encoder_mode: str = "appearance",
+      binary_calibration_method: Optional[str] = None,
+      multiclass_calibration_method: Optional[str] = None,
+      num_folds_for_cv: int = 5,
+      n_feature_crosses: Union[int, str] = 0,
+      n_svd_features: Union[int, str] = 0,
+      feature_allocation: str = "split",
+      total_svd_pool: Optional[int] = None,
+      enable_nnls: bool = False,
+      nnls_beta: float = 0.75,
+      ensemble_method: Optional[str] = None,
+      ensemble_selection_rounds: int = 25,
+      member_index: Optional[int] = None,
+      calibration_lambda: float = 1e-2,
+      min_rows_for_single_val_split: int = 2000,
   ):
     """Initialises the classifier.
 
     Args:
       model: Pre-trained TabFM model (NNX module).
-      config: Model configuration (absl flags or argparse namespace).
       n_estimators: Number of ensemble members.
       norm_methods: Normalization method(s) for the ensemble. Defaults to
         ``["none", "power"]``.
@@ -1409,9 +2046,12 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       class_shift: Whether to apply random class-label shifts.
       permute_categorical: Whether to randomly permute categorical values.
       outlier_threshold: Z-score threshold for outlier clipping.
+      max_num_features: Maximum number of features to subsample per ensemble
+        member.
+      max_num_rows: Maximum number of rows to subsample per ensemble member.
       softmax_temperature: Temperature applied before the final softmax.
-      average_logits: If True, average logits before applying softmax;
-        otherwise average probabilities.
+      average_logits: If True, average logits before applying softmax; otherwise
+        average probabilities.
       use_amp: Whether to use automatic mixed precision (currently informational
         only).
       batch_size: Number of ensemble members to forward through the model at
@@ -1420,15 +2060,47 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
       verbose: Whether to print informational messages.
       cat_encoder_mode: Categorical encoding order (``"appearance"`` or
         ``"frequency"``).
+      binary_calibration_method: Calibration method for binary problems
+        (``None`` or ``"platt"``).
+      multiclass_calibration_method: Calibration method for multiclass problems
+        (``None`` or ``"vector"``).
+      num_folds_for_cv: Number of folds for out-of-fold predictions.
+      n_feature_crosses: ``"sqrt"`` to add sqrt(n_features) random feature
+        crosses per ensemble member, or ``0`` to disable.
+      n_svd_features: ``"sqrt"`` to add sqrt(n_features) random SVD features per
+        ensemble member, or ``0`` to disable.
+      feature_allocation: ``"split"`` alternates augmented / non-augmented
+        members (the default ensemble diversity); ``"all"`` gives every member
+        the full feature-cross / SVD augmentation (use with ``n_estimators=1``
+        to build a single self-contained augmented view).
+      total_svd_pool: Total pool size of SVD features to generate.
+      enable_nnls: Whether to enable NNLS weighted ensemble.  Deprecated in
+        favor of ``ensemble_method="nnls"``; ignored when ``ensemble_method``
+        is set.
+      nnls_beta: Blending weight for NNLS.
+      ensemble_method: How to combine ensemble members: ``"mean"`` (simple
+        average), ``"nnls"`` (non-negative least squares on out-of-fold
+        predictions, blended with uniform via ``nnls_beta``), or ``"greedy"``
+        (Caruana-style greedy ensemble selection on out-of-fold predictions,
+        as used by AutoGluon / TabArena).  ``None`` falls back to
+        ``enable_nnls``.
+      ensemble_selection_rounds: Number of greedy selection rounds when
+        ``ensemble_method="greedy"``.
+      calibration_lambda: L2 regularization strength for calibration parameter
+        scaling.
+      min_rows_for_single_val_split: Minimum validation rows required to allow
+        learning ensemble/calibration weights on a single train/val split
+        instead of full CV. 0 means always doing full CV.
     """
     self.model = model
-    self.config = config
     self.n_estimators = n_estimators
     self.norm_methods = norm_methods
     self.feat_shuffle_method = feat_shuffle_method
     self.class_shift = class_shift
     self.permute_categorical = permute_categorical
     self.outlier_threshold = outlier_threshold
+    self.max_num_features = max_num_features
+    self.max_num_rows = max_num_rows
     self.softmax_temperature = softmax_temperature
     self.average_logits = average_logits
     self.use_amp = use_amp
@@ -1436,6 +2108,75 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     self.random_state = random_state
     self.verbose = verbose
     self.cat_encoder_mode = cat_encoder_mode
+    self.binary_calibration_method = binary_calibration_method
+    self.multiclass_calibration_method = multiclass_calibration_method
+    self.num_folds_for_cv = num_folds_for_cv
+    self.n_feature_crosses = n_feature_crosses
+    self.n_svd_features = n_svd_features
+    self.feature_allocation = feature_allocation
+    self.total_svd_pool = total_svd_pool
+    self.enable_nnls = enable_nnls
+    self.nnls_beta = nnls_beta
+    self.ensemble_method = ensemble_method
+    self.ensemble_selection_rounds = ensemble_selection_rounds
+    self.member_index = member_index
+    self.calibration_lambda = calibration_lambda
+    self.min_rows_for_single_val_split = min_rows_for_single_val_split
+    if self._resolved_ensemble_method() not in ("mean", "nnls", "greedy"):
+      raise ValueError(
+          f"Unknown ensemble_method: {ensemble_method!r}. Must be one of"
+          " 'mean', 'nnls', 'greedy'."
+      )
+    if self.average_logits and self._resolved_ensemble_method() != "mean":
+      raise ValueError(
+          "average_logits cannot be combined with a weighted ensemble"
+          " (enable_nnls / ensemble_method)."
+      )
+    if self.max_num_rows is not None and (
+        self._resolved_ensemble_method() != "mean"
+    ):
+      raise ValueError(
+          "max_num_rows cannot be combined with a weighted ensemble"
+          " (enable_nnls / ensemble_method) at this time."
+      )
+
+  def _resolved_ensemble_method(self) -> str:
+    """Resolves the ensemble weighting method.
+
+    ``ensemble_method`` takes precedence when set; otherwise falls back to
+    ``enable_nnls`` for backward compatibility.
+    """
+    if self.ensemble_method is not None:
+      return self.ensemble_method
+    return "nnls" if self.enable_nnls else "mean"
+
+  @classmethod
+  def ensemble(cls, model: Any, **overrides: Any) -> "TabFMClassifier":
+    """Constructs a classifier with the "ensemble" preset.
+
+    Enables the heavier ensembling/calibration features on top of the default
+    configuration: square-root feature-cross and SVD schedules, greedy
+    ensemble selection (as used by AutoGluon / TabArena), probability (rather
+    than logit) averaging, and per-problem calibration. Any keyword in ``overrides`` takes precedence over the preset.
+
+    Args:
+      model: Pre-trained TabFM model (NNX module).
+      **overrides: Constructor arguments that override the preset.
+
+    Returns:
+      A configured ``TabFMClassifier`` instance.
+    """
+    params = dict(
+        n_estimators=32,
+        average_logits=False,
+        n_feature_crosses="sqrt",
+        n_svd_features="sqrt",
+        ensemble_method="greedy",
+        binary_calibration_method="platt",
+        multiclass_calibration_method="vector",
+    )
+    params.update(overrides)
+    return cls(model, **params)
 
   def _more_tags(self):
     """Mark classifier as non-deterministic to bypass certain sklearn tests."""
@@ -1453,7 +2194,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     1. Encoding class labels using LabelEncoder
     2. Converting input features to numerical values
     3. Fitting the ensemble generator to create transformed dataset views
-    4. Using the pre-trained TabFM model
+    4. Loading the pre-trained TabFM model
 
     The model itself is not trained on the data; it uses in-context learning
     at inference time. This method only prepares the data transformations.
@@ -1467,13 +2208,14 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
 
     Raises:
       ValueError
-        If the number of classes exceeds the model's maximum supported classes
-        and hierarchical classification is disabled.
+        If the number of classes exceeds the model's maximum supported classes.
     """
     check_classification_targets(y)
 
     # Encode class labels
-    self.y_encoder_ = CategoricalOrdinalEncoder(dtype=np.int64)
+    self.y_encoder_ = CategoricalOrdinalEncoder(
+        dtype=np.int64, mode="alphabetical"
+    )
     # Reshape for CategoricalOrdinalEncoder
     y_2d = y.reshape(-1, 1) if isinstance(y, np.ndarray) else np.array(y).reshape(-1, 1)
     y_encoded = self.y_encoder_.fit_transform(y_2d)
@@ -1482,12 +2224,17 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     # CategoricalOrdinalEncoder stores categories in a list of arrays
     self.classes_ = self.y_encoder_.categories_[0]
     self.n_classes_ = len(self.classes_)
+    y_orig = y.copy()
+    self.active_calibration_method_ = (
+        self.binary_calibration_method
+        if self.n_classes_ == 2
+        else self.multiclass_calibration_method
+    )
 
-    if self.n_classes_ > self.model.max_classes and self.verbose:
-      print(
-          f"The number of classes ({self.n_classes_}) exceeds the max number of"
-          f" classes ({self.model.max_classes}) natively supported by the"
-          " model. Therefore, hierarchical classification is used."
+    if self.n_classes_ > self.model.max_classes:
+      raise ValueError(
+          f"The number of classes ({self.n_classes_}) exceeds the maximum number"
+          f" of classes ({self.model.max_classes}) supported by the model."
       )
 
     #  Transform input features
@@ -1513,19 +2260,103 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         cat_features=cat_features,
         permute_categorical=self.permute_categorical,
         outlier_threshold=self.outlier_threshold,
+        max_num_features=self.max_num_features,
+        max_num_rows=self.max_num_rows,
         random_state=self.random_state,
+        n_feature_crosses=self.n_feature_crosses,
+        n_svd_features=self.n_svd_features,
+        feature_allocation=self.feature_allocation,
+        total_svd_pool=self.total_svd_pool,
     )
     self.ensemble_generator_.fit(X, y)
+
+    oof_probs_fit = None
+    if self._resolved_ensemble_method() != "mean" or (
+        self.active_calibration_method_ is not None
+        and self.active_calibration_method_ != "none"
+    ):
+      oof_probs = self.predict_oof_proba(cv=self.num_folds_for_cv)
+      val_idx = getattr(self, "oof_val_indices_", None)
+      if val_idx is not None:
+        oof_probs_fit = oof_probs[:, val_idx, :]
+        y_orig_fit = y_orig[val_idx]
+        y_fit = y[val_idx]
+      else:
+        oof_probs_fit = oof_probs
+        y_orig_fit = y_orig
+        y_fit = y
+
+    if self._resolved_ensemble_method() == "nnls" and oof_probs_fit is not None:
+      n_classes = self.n_classes_
+      n_est, n_tr, _ = oof_probs_fit.shape
+
+      # Convert y_orig_fit to one-hot targets
+      y_one_hot = np.zeros((n_tr, n_classes))
+      y_one_hot[np.arange(n_tr), y_orig_fit] = 1.0
+
+      # Flatten along classification dimensions
+      oof_flat = oof_probs_fit.reshape(n_est, n_tr * n_classes)
+
+      y_one_hot_flat = y_one_hot.flatten()
+
+      weights, _ = opt.nnls(oof_flat.T, y_one_hot_flat)
+      sum_weights = np.sum(weights)
+      if sum_weights > 0:
+        weights = weights / sum_weights
+      else:
+        weights = np.ones(n_est) / n_est
+
+      avg_weights = np.ones(n_est) / n_est
+      self.ensemble_weights_ = (
+          self.nnls_beta * weights + (1.0 - self.nnls_beta) * avg_weights
+      )
+
+    if (
+        self._resolved_ensemble_method() == "greedy"
+        and oof_probs_fit is not None
+    ):
+      n_tr = oof_probs_fit.shape[1]
+      row_idx = np.arange(n_tr)
+
+      def _log_loss(probs: np.ndarray) -> float:
+        eps = 1e-15
+        return float(
+            -np.mean(np.log(np.clip(probs[row_idx, y_orig_fit], eps, None)))
+        )
+
+      self.ensemble_weights_ = greedy_ensemble_selection(
+          oof_probs_fit,
+          error_fn=_log_loss,
+          rounds=self.ensemble_selection_rounds,
+          renormalize=True,
+          random_state=self.random_state,
+      )
+
+    if (
+        self.active_calibration_method_ is not None
+        and self.active_calibration_method_ != "none"
+        and oof_probs_fit is not None
+    ):
+      if self._resolved_ensemble_method() != "mean":
+        P = np.tensordot(self.ensemble_weights_, oof_probs_fit, axes=(0, 0))
+      else:
+        P = np.mean(oof_probs_fit, axis=0)
+      assert P.shape == (len(y_fit), self.n_classes_), (
+          f"Expected calibration input shape {(len(y_fit), self.n_classes_)},"
+          f" got {P.shape}"
+      )
+      self._fit_calibration(P, y_fit)
 
     return self
 
   @jt.typed
   def _batch_forward(
       self,
-      Xs: jt.Float[jax.Array | np.ndarray, "B T H"],
-      ys: jt.Shaped[jax.Array | np.ndarray, "B T_train"],
-      cat_masks: Optional[jt.Bool[jax.Array | np.ndarray, "B H"]] = None,
-  ) -> jt.Float[jax.Array | np.ndarray, "B T_test K"]:
+      Xs: jt.Float[Array | np.ndarray, "B T H"],
+      ys: jt.Shaped[Array | np.ndarray, "B T_train"],
+      cat_masks: Optional[jt.Bool[Array | np.ndarray, "B H"]] = None,
+      ds: Optional[jt.Int[Array | np.ndarray, "B"]] = None,
+  ) -> jt.Float[Array | np.ndarray, "B T_test K"]:
     """Process model forward passes in batches to manage memory efficiently.
 
     This method handles the batched inference through the TabFM model,
@@ -1552,6 +2383,11 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         may use different Fourier frequencies or random embeddings compared to
         numerical features. If None, all features are treated as numerical.
 
+    ds : np.ndarray or None, optional
+        Array of shape (n_datasets,) indicating the number of active features
+        per
+        ensemble member, ignoring padding features.
+
     Returns
     -------
     np.ndarray
@@ -1559,141 +2395,497 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
         n_classes)
         where test_size = n_samples - train_size.
     """
-    mesh = jax.sharding.get_mesh()
-    if mesh and "data" in mesh.axis_names:
-      num_data_shards = mesh.axis_sizes[mesh.axis_names.index("data")]
-      data_sharding = NamedSharding(mesh, PartitionSpec("data"))
-    else:
-      num_data_shards = 1
-      data_sharding = None
+    is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
 
-    num_classes = self.n_classes_
-
-    _has_compiled_attr = (
-        "_predict_step_compiled_with_cat"
-        if (cat_masks is not None and hasattr(self.model, "cell_embedder"))
-        else "_predict_step_compiled_no_cat"
-    )
-
-    if not hasattr(self, _has_compiled_attr):
-      data_sharding = NamedSharding(
-          jax.sharding.Mesh(jax.devices(), ("data",)), PartitionSpec("data")
-      )
-
-      if cat_masks is not None and hasattr(self.model, "cell_embedder"):
-
-        @nnx.jit(
-            in_shardings=(
-                None,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-            ),
-            out_shardings=data_sharding,
+    if is_torch:
+      # --- PyTorch execution path ---
+      batch_size_per_process = self.batch_size or Xs.shape[0]
+      n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+      if n_batches > 1:
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        cat_masks_split = (
+            np.array_split(cat_masks, n_batches)
+            if cat_masks is not None
+            else [None] * n_batches
         )
-        def _predict_step_fn(model, X, y, train_size, d, cat_mask):
-          return model(
-              X,
-              y,
-              train_size=train_size,
-              d=d,
-              cat_mask=cat_mask,
-              num_classes=num_classes,
-          )
-
+        ds_split = (
+            np.array_split(ds, n_batches) if ds is not None else [None] * n_batches
+        )
       else:
-
-        @nnx.jit(
-            in_shardings=(
-                None,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-            ),
-            out_shardings=data_sharding,
-        )
-        def _predict_step_fn(model, X, y, train_size, d):
-          return model(
-              X,
-              y,
-              train_size=train_size,
-              d=d,
-              num_classes=num_classes,
-          )
-
-      setattr(self, _has_compiled_attr, _predict_step_fn)
-
-    _predict_step_compiled = getattr(self, _has_compiled_attr)
-
-    batch_size_per_process = self.batch_size or Xs.shape[0]
-    n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
-    if n_batches > 1:
-      Xs_split = np.array_split(Xs, n_batches)
-      ys_split = np.array_split(ys, n_batches)
-      if cat_masks is not None:
-        cat_masks_split = np.array_split(cat_masks, n_batches)
-    else:
-      Xs_split = [Xs]
-      ys_split = [ys]
-      if cat_masks is not None:
+        Xs_split = [Xs]
+        ys_split = [ys]
         cat_masks_split = [cat_masks]
+        ds_split = [ds]
 
-    outputs = []
-    cat_masks_iter = cat_masks_split if cat_masks is not None else [None] * len(Xs_split)
-    for X_batch, y_batch, cat_mask_batch in zip(Xs_split, ys_split, cat_masks_iter):
-      orig_batch_size = X_batch.shape[0]
-      X_batch = _pad_batch_to_multiple_of(X_batch, num_data_shards)
-      y_batch = _pad_batch_to_multiple_of(y_batch, num_data_shards)
+      outputs = []
+      for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+          Xs_split, ys_split, cat_masks_split, ds_split
+      ):
+        orig_batch_size = X_batch.shape[0]
+        orig_seq_len = X_batch.shape[1]
+        train_size_val = y_batch.shape[1]
 
-      X_batch = jax.device_put(jnp.array(X_batch, dtype=jnp.float32), data_sharding)
-      y_batch = jax.device_put(jnp.array(y_batch, dtype=jnp.float32), data_sharding)
-      batch_size_padded = X_batch.shape[0]
-      train_size_val = y_batch.shape[1]
-      train_size = jax.device_put(
-          jnp.repeat(train_size_val, batch_size_padded), data_sharding
-      )
-      d_batch = jax.device_put(
-          jnp.full((batch_size_padded,), X_batch.shape[-1], dtype=jnp.int32),
-          data_sharding,
-      )
+        # Pad y to match X length along sequence dimension if needed
+        if y_batch.shape[1] < X_batch.shape[1]:
+          y_batch = np.pad(
+              y_batch,
+              ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
+              mode="constant",
+              constant_values=-100.0,
+          )
 
-      # Pad y to match X length along sequence dimension
-      if y_batch.shape[1] < X_batch.shape[1]:
-        y_batch = jnp.pad(
+        out = _predict_step_pytorch(
+            self.model,
+            X_batch,
             y_batch,
-            ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
-            constant_values=-100.0,
+            train_size_val,
+            ds_batch_val,
+            cat_mask_batch,
         )
+        # Slice output to keep only test predictions and unpadded batch.
+        out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
+        outputs.append(out)
+      return np.concatenate(outputs, axis=0)
 
-
-
-      # No gradient calculation needed for inference
-      if cat_mask_batch is not None and hasattr(self.model, "cell_embedder"):
-        cat_mask_batch = _pad_batch_to_multiple_of(cat_mask_batch, num_data_shards)
-        cat_mask_batch = jax.device_put(
-            jnp.array(cat_mask_batch, dtype=jnp.bool_), data_sharding
-        )
-        out = _predict_step_compiled(
-            self.model, X_batch, y_batch, train_size, d_batch, cat_mask_batch
-        )
+    else:
+      if not HAS_JAX:
+        raise ImportError("JAX is required to run a JAX model.")
+      # --- JAX execution path ---
+      mesh = jax.sharding.get_mesh()
+      if mesh and "data" in mesh.axis_names:
+        num_data_shards = mesh.axis_sizes[mesh.axis_names.index("data")]
+        data_sharding = NamedSharding(mesh, PartitionSpec("data"))
       else:
-        out = _predict_step_compiled(
-            self.model, X_batch, y_batch, train_size, d_batch
+        num_data_shards = 1
+        data_sharding = None
+
+      num_classes = self.n_classes_
+
+      _has_compiled_attr = (
+          "_predict_step_compiled_with_cat"
+          if (cat_masks is not None and hasattr(self.model, "cell_embedder"))
+          else "_predict_step_compiled_no_cat"
+      )
+
+      if not hasattr(self, _has_compiled_attr):
+        if cat_masks is not None and hasattr(self.model, "cell_embedder"):
+
+          @nnx.jit(
+              in_shardings=(
+                  None,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+              ),
+              out_shardings=data_sharding,
+          )
+          def _predict_step_fn(model, X, y, train_size, d, cat_mask):
+            return model(
+                X,
+                y,
+                train_size=train_size,
+                d=d,
+                cat_mask=cat_mask,
+                num_classes=num_classes,
+            )
+
+        else:
+
+          @nnx.jit(
+              in_shardings=(
+                  None,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+              ),
+              out_shardings=data_sharding,
+          )
+          def _predict_step_fn(model, X, y, train_size, d):
+            return model(
+                X,
+                y,
+                train_size=train_size,
+                d=d,
+                num_classes=num_classes,
+            )
+
+        setattr(self, _has_compiled_attr, _predict_step_fn)
+
+      _predict_step_compiled = getattr(self, _has_compiled_attr)
+
+      batch_size_per_process = self.batch_size or Xs.shape[0]
+      n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+      if n_batches > 1:
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        if cat_masks is not None:
+          cat_masks_split = np.array_split(cat_masks, n_batches)
+        if ds is not None:
+          ds_split = np.array_split(ds, n_batches)
+      else:
+        Xs_split = [Xs]
+        ys_split = [ys]
+        if cat_masks is not None:
+          cat_masks_split = [cat_masks]
+        if ds is not None:
+          ds_split = [ds]
+
+      outputs = []
+      cat_masks_iter = (
+          cat_masks_split if cat_masks is not None else [None] * len(Xs_split)
+      )
+      ds_iter = ds_split if ds is not None else [None] * len(Xs_split)
+      for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+          Xs_split, ys_split, cat_masks_iter, ds_iter
+      ):
+        orig_batch_size = X_batch.shape[0]
+        orig_seq_len = X_batch.shape[1]
+
+        # Follow prefill(): pad sequence length T (n_row) to a multiple of 128
+        # with -100. Padded rows fall past train_size and are sliced off below.
+        _block_size = 128
+        _T_full = X_batch.shape[1]
+        _pad_len = ((_T_full - 1) // _block_size + 1) * _block_size - _T_full
+        if _pad_len > 0:
+          X_batch = np.pad(
+              X_batch, ((0, 0), (0, _pad_len), (0, 0)), constant_values=-100.0
+          )
+
+        X_batch = _pad_batch_to_multiple_of(X_batch, num_data_shards)
+        y_batch = _pad_batch_to_multiple_of(y_batch, num_data_shards)
+
+        X_batch = jax.device_put(
+            jnp.array(X_batch, dtype=jnp.float32), data_sharding
+        )
+        y_batch = jax.device_put(
+            jnp.array(y_batch, dtype=jnp.float32), data_sharding
+        )
+        batch_size_padded = X_batch.shape[0]
+        train_size_val = y_batch.shape[1]
+        train_size = jax.device_put(
+            jnp.repeat(train_size_val, batch_size_padded), data_sharding
         )
 
-      # Slice output to keep only test predictions and unpadded batch.
-      out = out[:orig_batch_size, train_size_val:, :]
-      from jax.experimental import multihost_utils  # pylint: disable=g-import-not-at-top
-      out = multihost_utils.process_allgather(out, tiled=True)
-      outputs.append(out)
+        if ds_batch_val is not None:
+          ds_batch = _pad_batch_to_multiple_of(
+              ds_batch_val, num_data_shards, constant_value=X_batch.shape[-1]
+          )
+        else:
+          ds_batch = np.full(
+              (batch_size_padded,), X_batch.shape[-1], dtype=np.int32
+          )
 
-    return np.concatenate(outputs, axis=0)
+        d_batch = jax.device_put(
+            jnp.array(ds_batch, dtype=np.int32),
+            data_sharding,
+        )
+
+        # Pad y to match X length along sequence dimension
+        if y_batch.shape[1] < X_batch.shape[1]:
+          y_batch = jnp.pad(
+              y_batch,
+              ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
+              constant_values=-100.0,
+          )
+
+        if jax.process_index() == 0:
+          logging.info("X_batch shape: %s", X_batch.shape)
+          logging.info("y_batch shape: %s", y_batch.shape)
+          logging.info("train_size: %s", train_size_val)
+
+        # No gradient calculation needed for inference
+        if cat_mask_batch is not None and hasattr(self.model, "cell_embedder"):
+          cat_mask_batch = _pad_batch_to_multiple_of(
+              cat_mask_batch, num_data_shards
+          )
+          cat_mask_batch = jax.device_put(
+              jnp.array(cat_mask_batch, dtype=jnp.bool_), data_sharding
+          )
+          out = _predict_step_compiled(
+              self.model, X_batch, y_batch, train_size, d_batch, cat_mask_batch
+          )
+        else:
+          out = _predict_step_compiled(
+              self.model, X_batch, y_batch, train_size, d_batch
+          )
+
+        # Slice output to keep only test predictions and unpadded batch.
+        out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
+        out = multihost_utils.process_allgather(out, tiled=True)
+        outputs.append(out)
+
+      return np.concatenate(outputs, axis=0)
+
+  def __getstate__(self):
+    """Drops memoized compiled predict functions from the pickled state.
+
+    The first predict memoizes nnx.jit-compiled step functions on the
+    estimator (see _batch_forward). Those closures cannot be pickled; they
+    are pure caches and are rebuilt lazily on the next predict.
+    """
+    state = dict(super().__getstate__())
+    for attr in _COMPILED_PREDICT_CACHE_ATTRS:
+      state.pop(attr, None)
+    return state
 
   @jt.typed
-  def predict_proba(self, X: Any) -> jt.Float[jax.Array | np.ndarray, "T K"]:
+  def predict_oof_proba(self, cv: int = 5) -> jt.Float[Array | np.ndarray, "E N K"]:
+    """Perform out-of-fold predictions on the training set for each ensemble member."""
+    check_is_fitted(self)
+
+    N = self.ensemble_generator_.X_.shape[0]
+    n_classes = self.n_classes_
+
+    all_configs = []
+    for (
+        norm_method,
+        configs,
+    ) in self.ensemble_generator_.ensemble_configs_.items():
+      for config in configs:
+        all_configs.append((norm_method, config))
+    n_estimators = len(all_configs)
+
+    kf = KFold(n_splits=cv, shuffle=True, random_state=self.random_state)
+    # Take the number of rows from the first config if max_num_rows is given,
+    # or use N otherwise.
+    _, _, _, first_row_sub_pattern = all_configs[0][1]
+    n_rows = (
+        len(first_row_sub_pattern) if first_row_sub_pattern is not None else N
+    )
+    folds_base = list(kf.split(np.arange(n_rows)))
+
+    if (
+        getattr(self, "min_rows_for_single_val_split", 0) > 0
+        and len(folds_base[0][1]) >= self.min_rows_for_single_val_split
+    ):
+      folds_to_run = folds_base[:1]
+    else:
+      folds_to_run = folds_base
+
+    outputs_oof = np.zeros((n_estimators, N, n_classes))
+
+    self.oof_val_indices_ = None
+    for fold_idx, (train_fold, val_fold) in enumerate(folds_to_run):
+      data_fold, val_indices_list = self.ensemble_generator_.transform_fold(
+          train_fold, val_fold
+      )
+      if fold_idx == 0 and len(folds_to_run) == 1:
+        self.oof_val_indices_ = val_indices_list[0]
+      (
+          Xs_batch,
+          ys_batch,
+          cat_masks_batch,
+          ds_batch,
+          configs_flat,
+      ) = self.ensemble_generator_.prepare_ensemble_tensors(data_fold)
+
+      out = self._batch_forward(
+          Xs_batch, ys_batch, cat_masks_batch, ds=ds_batch
+      )
+      _check_classifier_output_dim(out.shape[-1], n_classes)
+      out = out[..., :n_classes]
+
+      for i, (_, shift_offset, _, _) in enumerate(configs_flat):
+        out_i = out[i]
+        out_i = np.concatenate(
+            [out_i[..., shift_offset:], out_i[..., :shift_offset]], axis=-1
+        )
+        out_i = self.softmax(
+            out_i, axis=-1, temperature=self.softmax_temperature
+        )
+        outputs_oof[i, val_indices_list[i]] = out_i
+
+    return outputs_oof
+
+  @jt.typed
+  def _fit_calibration(
+      self,
+      P: jt.Float[Array | np.ndarray, "N K"],
+      y: jt.Int[Array | np.ndarray, "N"],
+  ):
+    """Fit calibration model on out-of-fold predictions.
+
+    Args:
+      P: Out-of-fold probability predictions of shape (N, K), where N is the
+        number of training samples and K is the number of classes.
+      y: Ground truth targets of shape (N,). Note that y is not one-hot encoded,
+        but contains the actual class numeric/integer labels.
+    """
+    K = self.n_classes_
+    N = P.shape[0]
+    eps = 1e-15
+
+    if self.verbose:
+      print(
+          f"Fitting calibration model ({self.active_calibration_method_}) with"
+          f" {K} classes..."
+      )
+
+    if K == 2:
+      if self.active_calibration_method_ == "platt":
+        z = np.log((P[:, 1] + eps) / (P[:, 0] + eps))
+
+        def loss(params):
+          A, B = params
+          p1 = scipy.special.expit(A * z + B)
+          p = np.column_stack([1 - p1, p1])
+          nll = -np.sum(np.log(p[np.arange(N), y] + eps)) / N
+          reg = self.calibration_lambda * ((A - 1.0) ** 2 + B**2)
+          return nll + reg
+
+        res = opt.minimize(
+            loss,
+            np.array([1.0, 0.0]),
+            bounds=[(0.8, 1.2), (-1.0, 1.0)],
+            method="L-BFGS-B",
+        )
+        self.calibration_params_ = {"A": res.x[0], "B": res.x[1]}
+      else:
+        raise ValueError(
+            "Unknown binary_calibration_method:"
+            f" {self.active_calibration_method_!r}. Expected None or 'platt'."
+        )
+
+    else:
+      if self.active_calibration_method_ == "vector":
+        z = np.log(P + eps)
+
+        def loss(params):
+          w = params[:K]
+          b = params[K:]
+          z_prime = w * z + b
+          p = scipy.special.softmax(z_prime, axis=1)
+          nll = -np.sum(np.log(p[np.arange(N), y] + eps)) / N
+          reg = self.calibration_lambda * (
+              np.sum((w - 1.0) ** 2) + np.sum(b**2)
+          )
+          return nll + reg
+
+        init_params = np.concatenate([np.ones(K), np.zeros(K)])
+        res = opt.minimize(
+            loss,
+            init_params,
+            bounds=[(0.8, 1.2)] * K + [(-1.0, 1.0)] * K,
+            method="L-BFGS-B",
+        )
+        self.calibration_params_ = {"w": res.x[:K], "b": res.x[K:]}
+      else:
+        raise ValueError(
+            "Unknown multiclass_calibration_method:"
+            f" {self.active_calibration_method_!r}. Expected None or 'vector'."
+        )
+
+  @jt.typed
+  def _apply_calibration(
+      self, P: jt.Float[Array | np.ndarray, "N K"]
+  ) -> jt.Float[Array | np.ndarray, "N K"]:
+    """Apply calibration model to predictions.
+
+    Args:
+      P: Uncalibrated predicted probabilities of shape (N, K), where N is the
+        number of samples and K is the number of classes.
+
+    Returns:
+      Calibrated predicted probabilities of shape (N, K).
+    """
+    if not hasattr(self, "calibration_params_") or not self.calibration_params_:
+      return P
+
+    K = self.n_classes_
+    eps = 1e-15
+
+    if self.active_calibration_method_ == "platt" and K == 2:
+      A = self.calibration_params_["A"]
+      B = self.calibration_params_["B"]
+      z = np.log((P[:, 1] + eps) / (P[:, 0] + eps))
+      p1 = scipy.special.expit(A * z + B)
+      return np.column_stack([1 - p1, p1])
+
+    elif self.active_calibration_method_ == "vector":
+      w = self.calibration_params_["w"]
+      b = self.calibration_params_["b"]
+      z = np.log(P + eps)
+      z_prime = w * z + b
+      return scipy.special.softmax(z_prime, axis=1)
+
+    return P
+
+  @jt.typed
+  def _predict_proba_internal(self, X: Any) -> jt.Float[Array | np.ndarray, "E T K"]:
+    """Predict class probabilities for test samples."""
+    check_is_fitted(self)
+    if isinstance(X, np.ndarray) and len(X.shape) == 1:
+      raise ValueError(
+          "The provided input X is one-dimensional. Reshape your data."
+      )
+
+    X_transformed = self.X_encoder_.transform(X)
+    data = self.ensemble_generator_.transform(X_transformed)
+    (
+        Xs_all,
+        ys_all,
+        cat_masks_all,
+        ds_all,
+        _,
+    ) = self.ensemble_generator_.prepare_ensemble_tensors(data)
+
+    if self.member_index is not None:
+      # Run only member ``member_index`` of the (fully-generated) ensemble.
+      mi = self.member_index
+      Xs_all = Xs_all[mi : mi + 1]
+      ys_all = ys_all[mi : mi + 1]
+      cat_masks_all = cat_masks_all[mi : mi + 1]
+      ds_all = ds_all[mi : mi + 1]
+
+    outputs = self._batch_forward(Xs_all, ys_all, cat_masks_all, ds=ds_all)
+    _check_classifier_output_dim(outputs.shape[-1], self.n_classes_)
+    outputs = outputs[..., :self.n_classes_]
+
+    # Extract class shift offsets from ensemble generator (same flat member
+    # order as the tensors), selecting the single member when requested.
+    class_shift_offsets = []
+    for offsets in self.ensemble_generator_.class_shift_offsets_.values():
+      class_shift_offsets.extend(offsets)
+    if self.member_index is not None:
+      class_shift_offsets = class_shift_offsets[
+          self.member_index : self.member_index + 1
+      ]
+
+    # Correct for class shifts and return raw logits for all estimators
+    all_logits = []
+    for i, offset in enumerate(class_shift_offsets):
+      out = outputs[i]
+      out = np.concatenate([out[..., offset:], out[..., :offset]], axis=-1)
+      all_logits.append(out)
+
+    return np.stack(all_logits, axis=0)
+
+  def _process_logits(self, logits_all: np.ndarray):
+    probs_all = self.softmax(
+        logits_all, axis=-1, temperature=self.softmax_temperature
+    )
+
+    if self._resolved_ensemble_method() != "mean":
+      probs = np.tensordot(self.ensemble_weights_, probs_all, axes=(0, 0))
+    elif self.average_logits:
+      avg_logits = np.mean(logits_all, axis=0)
+      probs = self.softmax(
+          avg_logits, axis=-1, temperature=self.softmax_temperature
+      )
+    else:
+      probs = np.mean(probs_all, axis=0)
+
+    if self.active_calibration_method_ is not None:
+      probs = self._apply_calibration(probs)
+
+    return probs
+
+  @jt.typed
+  def predict_proba(self, X: Any) -> jt.Float[Array | np.ndarray, "T K"]:
     """Predict class probabilities for test samples.
 
     Applies the ensemble of TabFM models to make predictions, with each
@@ -1706,75 +2898,17 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     5. Averages predictions across ensemble members
 
     Args:
-      X : array-like of shape (n_samples, n_features)
-        Test samples for prediction.
+      X: array-like of shape (n_samples, n_features). Test samples for
+        prediction.
 
     Returns:
       np.ndarray of shape (n_samples, n_classes)
         Class probabilities for each test sample.
     """
     check_is_fitted(self)
-    if isinstance(X, np.ndarray) and len(X.shape) == 1:
-      # Reject 1D arrays to maintain sklearn compatibility
-      raise ValueError(
-          f"The provided input X is one-dimensional. Reshape your data."
-      )
 
-    X = self.X_encoder_.transform(X)
-    data = self.ensemble_generator_.transform(X)
-    Xs_all, ys_all, cat_masks_all = [], [], []
-    for norm_method, (Xs, ys) in data.items():
-      Xs_all.append(Xs)
-      ys_all.append(ys)
-      configs = self.ensemble_generator_.ensemble_configs_[norm_method]
-      for shuffle_pattern, _, _ in configs:
-        mask = np.zeros(self.ensemble_generator_.n_features_in_, dtype=np.bool_)
-        if hasattr(self.ensemble_generator_, "cat_features_"):
-          mask[self.ensemble_generator_.cat_features_] = True
-        cat_masks_all.append(mask[shuffle_pattern])
-
-    # Concatenate all ensemble generation variants to run evaluate forward logic in single batch
-    Xs_all = np.concatenate(Xs_all, axis=0)
-    ys_all = np.concatenate(ys_all, axis=0)
-    cat_masks_all = np.stack(cat_masks_all, axis=0)
-    outputs = self._batch_forward(Xs_all, ys_all, cat_masks_all)
-    outputs = outputs[..., :self.n_classes_]
-
-    # Extract class shift offsets from ensemble generator
-    class_shift_offsets = []
-    for offsets in self.ensemble_generator_.class_shift_offsets_.values():
-      class_shift_offsets.extend(offsets)
-
-    # Determine actual number of ensemble members
-    # May be fewer than requested if dataset has quite limited features and classes
-    n_estimators = len(class_shift_offsets)
-
-    # Aggregate predictions from all ensemble members, correcting for class shifts
-    avg = None
-    for i, offset in enumerate(class_shift_offsets):
-      out = outputs[i]
-
-      # Slice to the actual number of classes to avoid rotating padding/garbage
-
-      # Reverse the class shift
-      out = np.concatenate([out[..., offset:], out[..., :offset]], axis=-1)
-
-      if not self.average_logits:
-        out = self.softmax(out, axis=1, temperature=self.softmax_temperature)
-
-      if avg is None:
-        avg = out
-      else:
-        avg += out
-
-    # Calculate ensemble average
-    avg /= n_estimators
-
-    if self.average_logits:
-      return self.softmax(avg, axis=1, temperature=self.softmax_temperature)
-
-    # Normalize probabilities to sum to 1
-    return avg / avg.sum(axis=1, keepdims=True)
+    logits = self._predict_proba_internal(X)
+    return self._process_logits(logits)
 
   @jt.typed
   def predict(self, X: Any) -> np.ndarray:
@@ -1795,7 +2929,7 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
     y = np.argmax(proba[:, : self.n_classes_], axis=1)
     y_2d = y.reshape(-1, 1)
     y_decoded = self.y_encoder_.inverse_transform(y_2d)
-    return y_decoded.flatten()
+    return y_decoded.flatten().astype(self.classes_.dtype)
 
   @jt.typed
   @staticmethod
@@ -1837,58 +2971,161 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     X_encoder_: Fitted ``TransformToNumerical`` for input features.
     y_scaler_: Fitted ``StandardScaler`` for target standardization.
     ensemble_generator_: Fitted ``EnsembleGenerator``.
+    y_oof_scaled_: Out-of-fold scaled target predictions for the training set.
+    ensemble_weights_: Blending weights for ensemble members, computed via
+      NNLS or greedy ensemble selection.
   """
 
   X_encoder_: TransformToNumerical
   y_scaler_: StandardScaler
   ensemble_generator_: EnsembleGenerator
+  y_oof_scaled_: np.ndarray
+  ensemble_weights_: np.ndarray
 
   def __init__(
       self,
       model: Any,
-      config: Optional[Union[argparse.Namespace, flags.FlagValues]] = None,
       n_estimators: int = 32,
       norm_methods: Optional[Union[str, List[str]]] = None,
-      feat_shuffle_method: str = "latin",
+      feat_shuffle_method: str = "random",
       permute_categorical: bool = False,
       outlier_threshold: float = 4.0,
+      max_num_features: Optional[int] = 500,
+      max_num_rows: Optional[int] = None,
       use_amp: bool = True,
       batch_size: Optional[int] = 1,
-      random_state: Optional[int] = 42,
+      random_state: Optional[int] = _DEFAULT_RANDOM_STATE,
       verbose: bool = False,
       cat_encoder_mode: str = "appearance",
+      num_folds_for_cv: int = 5,
+      n_feature_crosses: Union[int, str] = 0,
+      n_svd_features: Union[int, str] = 0,
+      feature_allocation: str = "split",
+      total_svd_pool: Optional[int] = None,
+      enable_nnls: bool = False,
+      nnls_beta: float = 0.75,
+      ensemble_method: Optional[str] = None,
+      ensemble_selection_rounds: int = 25,
+      member_index: Optional[int] = None,
+      min_rows_for_single_val_split: int = 2000,
   ):
     """Initialises the regressor.
 
     Args:
       model: Pre-trained TabFM model (NNX module).
-      config: Model configuration (absl flags or argparse namespace).
       n_estimators: Number of ensemble members.
       norm_methods: Normalization method(s) for the ensemble.  Defaults to
         ``["none", "power"]``.
       feat_shuffle_method: Feature-permutation strategy for the ensemble.
       permute_categorical: Whether to randomly permute categorical values.
       outlier_threshold: Z-score threshold for outlier clipping.
+      max_num_features: Maximum number of features to subsample per ensemble
+        member.
+      max_num_rows: Maximum number of rows to subsample per ensemble member.
       use_amp: Whether to use automatic mixed precision (informational only).
-      batch_size: Number of ensemble members to forward at once.  ``None``
-        or 0 means all at once.
+      batch_size: Number of ensemble members to forward at once.  ``None`` or 0
+        means all at once.
       random_state: Seed for ensemble randomness.
       verbose: Whether to print informational messages.
       cat_encoder_mode: Categorical encoding order (``"appearance"`` or
         ``"frequency"``).
+      num_folds_for_cv: Number of folds for out-of-fold predictions.
+      n_feature_crosses: ``"sqrt"`` to add sqrt(n_features) random feature
+        crosses per ensemble member, or ``0`` to disable.
+      n_svd_features: ``"sqrt"`` to add sqrt(n_features) random SVD features per
+        ensemble member, or ``0`` to disable.
+      feature_allocation: ``"split"`` alternates augmented / non-augmented
+        members (the default ensemble diversity); ``"all"`` gives every member
+        the full feature-cross / SVD augmentation (use with ``n_estimators=1``
+        to build a single self-contained augmented view).
+      total_svd_pool: Total pool size of SVD features to generate.
+      enable_nnls: Whether to enable NNLS weighted ensemble.  Deprecated in
+        favor of ``ensemble_method="nnls"``; ignored when ``ensemble_method``
+        is set.
+      nnls_beta: Blending weight for NNLS.
+      ensemble_method: How to combine ensemble members: ``"mean"`` (simple
+        average), ``"nnls"`` (non-negative least squares on out-of-fold
+        predictions, blended with uniform via ``nnls_beta``), or ``"greedy"``
+        (Caruana-style greedy ensemble selection on out-of-fold predictions,
+        as used by AutoGluon / TabArena).  ``None`` falls back to
+        ``enable_nnls``.
+      ensemble_selection_rounds: Number of greedy selection rounds when
+        ``ensemble_method="greedy"``.
+      min_rows_for_single_val_split: Minimum validation rows required to allow
+        learning ensemble weights on a single train/val split instead of full
+        CV. 0 means always doing full CV.
     """
     self.model = model
-    self.config = config
     self.n_estimators = n_estimators
     self.norm_methods = norm_methods
     self.feat_shuffle_method = feat_shuffle_method
     self.permute_categorical = permute_categorical
     self.outlier_threshold = outlier_threshold
+    self.max_num_features = max_num_features
+    self.max_num_rows = max_num_rows
     self.use_amp = use_amp
     self.batch_size = batch_size
     self.random_state = random_state
     self.verbose = verbose
     self.cat_encoder_mode = cat_encoder_mode
+    self.num_folds_for_cv = num_folds_for_cv
+    self.n_feature_crosses = n_feature_crosses
+    self.n_svd_features = n_svd_features
+    self.feature_allocation = feature_allocation
+    self.total_svd_pool = total_svd_pool
+    self.enable_nnls = enable_nnls
+    self.nnls_beta = nnls_beta
+    self.ensemble_method = ensemble_method
+    self.ensemble_selection_rounds = ensemble_selection_rounds
+    self.member_index = member_index
+    self.min_rows_for_single_val_split = min_rows_for_single_val_split
+    if self._resolved_ensemble_method() not in ("mean", "nnls", "greedy"):
+      raise ValueError(
+          f"Unknown ensemble_method: {ensemble_method!r}. Must be one of"
+          " 'mean', 'nnls', 'greedy'."
+      )
+    if self.max_num_rows is not None and (
+        self._resolved_ensemble_method() != "mean"
+    ):
+      raise ValueError(
+          "max_num_rows cannot be combined with a weighted ensemble"
+          " (enable_nnls / ensemble_method) at this time."
+      )
+
+  def _resolved_ensemble_method(self) -> str:
+    """Resolves the ensemble weighting method.
+
+    ``ensemble_method`` takes precedence when set; otherwise falls back to
+    ``enable_nnls`` for backward compatibility.
+    """
+    if self.ensemble_method is not None:
+      return self.ensemble_method
+    return "nnls" if self.enable_nnls else "mean"
+
+  @classmethod
+  def ensemble(cls, model: Any, **overrides: Any) -> "TabFMRegressor":
+    """Constructs a regressor with the "ensemble" preset.
+
+    Enables the heavier ensembling features on top of the default configuration:
+    square-root feature-cross and SVD schedules and greedy ensemble selection
+    (as used by AutoGluon / TabArena). Any keyword in ``overrides`` takes
+    precedence over the preset.
+
+    Args:
+      model: Pre-trained TabFM model (NNX module).
+      **overrides: Constructor arguments that override the preset.
+
+    Returns:
+      A configured ``TabFMRegressor`` instance.
+    """
+    params = dict(
+        n_estimators=32,
+        n_feature_crosses="sqrt",
+        n_svd_features="sqrt",
+        ensemble_method="greedy",
+    )
+    params.update(overrides)
+    return cls(model, **params)
 
   def _more_tags(self):
     """Mark regressor as non-deterministic to bypass certain sklearn tests."""
@@ -1915,6 +3152,7 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
       self : TabFMRegressor
           Fitted regressor instance.
     """
+    y_orig = np.array(y).copy()
     y = check_array(y, ensure_2d=False, dtype="numeric")
     self.X_encoder_ = TransformToNumerical(
         verbose=self.verbose, cat_encoder_mode=self.cat_encoder_mode
@@ -1938,19 +3176,67 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
         cat_features=cat_features,
         permute_categorical=self.permute_categorical,
         outlier_threshold=self.outlier_threshold,
+        max_num_features=self.max_num_features,
+        max_num_rows=self.max_num_rows,
         random_state=self.random_state,
         task="regression",
+        n_feature_crosses=self.n_feature_crosses,
+        n_svd_features=self.n_svd_features,
+        feature_allocation=self.feature_allocation,
+        total_svd_pool=self.total_svd_pool,
     )
     self.ensemble_generator_.fit(X, y)
+
+    if self._resolved_ensemble_method() != "mean":
+      self.y_oof_scaled_ = self._compute_oof_preds_scaled(
+          cv=self.num_folds_for_cv
+      )
+      val_idx = getattr(self, "oof_val_indices_", None)
+      y_oof_scaled_fit = (
+          self.y_oof_scaled_[:, val_idx]
+          if val_idx is not None
+          else self.y_oof_scaled_
+      )
+      y_orig_fit = y_orig[val_idx] if val_idx is not None else y_orig
+      n_est, n_tr = y_oof_scaled_fit.shape
+      y_oof = np.zeros((n_est, n_tr))
+      for i in range(n_est):
+        y_oof[i, :] = self._inverse_transform_y(y_oof_scaled_fit[i])
+
+      if self._resolved_ensemble_method() == "greedy":
+
+        def _rmse(preds: np.ndarray) -> float:
+          return float(np.sqrt(np.mean((preds - y_orig_fit) ** 2)))
+
+        self.ensemble_weights_ = greedy_ensemble_selection(
+            y_oof,
+            error_fn=_rmse,
+            rounds=self.ensemble_selection_rounds,
+            random_state=self.random_state,
+        )
+      else:
+        weights, _ = opt.nnls(y_oof.T, y_orig_fit)
+        sum_weights = np.sum(weights)
+        if sum_weights > 0:
+          weights = weights / sum_weights
+        else:
+          weights = np.ones(n_est) / n_est
+
+        avg_weights = np.ones(n_est) / n_est
+        self.ensemble_weights_ = (
+            self.nnls_beta * weights + (1.0 - self.nnls_beta) * avg_weights
+        )
+
     return self
 
   @jt.typed
   def _batch_forward(
       self,
-      Xs: jt.Float[jax.Array | np.ndarray, "B T H"],
-      ys: jt.Shaped[jax.Array | np.ndarray, "B T_train"],
-      cat_masks: Optional[jt.Bool[jax.Array | np.ndarray, "B H"]] = None,
-  ) -> jt.Float[jax.Array | np.ndarray, "B T_test L_out"]:
+      Xs: jt.Float[Array | np.ndarray, "B T H"],
+      ys: jt.Shaped[Array | np.ndarray, "B T_train"],
+      cat_masks: Optional[jt.Bool[Array | np.ndarray, "B H"]] = None,
+      ds: Optional[jt.Int[Array | np.ndarray, "B"]] = None,
+  ) -> jt.Float[Array | np.ndarray, "B T_test L_out"]:
     """Process model forward passes in batches to manage memory efficiently.
 
     Args:
@@ -1962,176 +3248,382 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
         example, categorical features may use different Fourier frequencies or
         random embeddings compared to numerical features. If None, all features
         are treated as numerical.
+      ds: Optional array of shape (n_datasets,) indicating the number of active
+        features per ensemble member, ignoring padding features.
+
     Returns:
       Model outputs of shape (n_datasets, n_test, output_dim).
     """
-    mesh = jax.sharding.get_mesh()
-    if mesh and "data" in mesh.axis_names:
-      num_data_shards = mesh.axis_sizes[mesh.axis_names.index("data")]
-      data_sharding = NamedSharding(mesh, PartitionSpec("data"))
-    else:
-      num_data_shards = 1
-      data_sharding = None
+    is_torch = HAS_TORCH and isinstance(self.model, torch.nn.Module)
 
-    _has_compiled_attr = (
-        "_predict_step_compiled_with_cat"
-        if (cat_masks is not None and hasattr(self.model, "cell_embedder"))
-        else "_predict_step_compiled_no_cat"
-    )
-
-    if not hasattr(self, _has_compiled_attr):
-      data_sharding = NamedSharding(
-          jax.sharding.Mesh(jax.devices(), ("data",)), PartitionSpec("data")
-      )
-
-      if cat_masks is not None and hasattr(self.model, "cell_embedder"):
-
-        @nnx.jit(
-            in_shardings=(
-                None,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-            ),
-            out_shardings=data_sharding,
+    if is_torch:
+      # --- PyTorch execution path ---
+      batch_size_per_process = getattr(self, "batch_size", 1) or Xs.shape[0]
+      n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+      if n_batches > 1:
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        cat_masks_split = (
+            np.array_split(cat_masks, n_batches)
+            if cat_masks is not None
+            else [None] * n_batches
         )
-        def _predict_step_fn(model, X, y, train_size, d, cat_mask):
-          return model(
-              X,
-              y,
-              train_size=train_size,
-              d=d,
-              cat_mask=cat_mask,
-          )
-
+        ds_split = (
+            np.array_split(ds, n_batches) if ds is not None else [None] * n_batches
+        )
       else:
-
-        @nnx.jit(
-            in_shardings=(
-                None,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-                data_sharding,
-            ),
-            out_shardings=data_sharding,
-        )
-        def _predict_step_fn(model, X, y, train_size, d):
-          return model(
-              X,
-              y,
-              train_size=train_size,
-              d=d,
-          )
-
-      setattr(self, _has_compiled_attr, _predict_step_fn)
-
-    _predict_step_compiled = getattr(self, _has_compiled_attr)
-    batch_size_per_process = getattr(self, "batch_size", 1) or Xs.shape[0]
-    n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
-    if n_batches > 1:
-      Xs_split = np.array_split(Xs, n_batches)
-      ys_split = np.array_split(ys, n_batches)
-      if cat_masks is not None:
-        cat_masks_split = np.array_split(cat_masks, n_batches)
-    else:
-      Xs_split, ys_split = [Xs], [ys]
-      if cat_masks is not None:
+        Xs_split = [Xs]
+        ys_split = [ys]
         cat_masks_split = [cat_masks]
+        ds_split = [ds]
 
-    outputs = []
-    cat_masks_iter = cat_masks_split if cat_masks is not None else [None] * len(Xs_split)
-    for X_batch, y_batch, cat_mask_batch in zip(Xs_split, ys_split, cat_masks_iter):
-      orig_batch_size = X_batch.shape[0]
-      X_batch = _pad_batch_to_multiple_of(X_batch, num_data_shards)
-      y_batch = _pad_batch_to_multiple_of(y_batch, num_data_shards)
+      outputs = []
+      for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+          Xs_split, ys_split, cat_masks_split, ds_split
+      ):
+        orig_batch_size = X_batch.shape[0]
+        orig_seq_len = X_batch.shape[1]
+        train_size_val = y_batch.shape[1]
 
-      X_batch = jax.device_put(jnp.array(X_batch, dtype=jnp.float32), data_sharding)
-      y_batch = jax.device_put(jnp.array(y_batch, dtype=jnp.float32), data_sharding)
-      batch_size_padded = X_batch.shape[0]
-      train_size_val = y_batch.shape[1]
-      train_size = jax.device_put(
-          jnp.repeat(train_size_val, batch_size_padded), data_sharding
-      )
-      d_batch = jax.device_put(
-          jnp.full((batch_size_padded,), X_batch.shape[-1], dtype=jnp.int32),
-          data_sharding,
-      )
+        # Pad y to match X length along sequence dimension if needed
+        if y_batch.shape[1] < X_batch.shape[1]:
+          y_batch = np.pad(
+              y_batch,
+              ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
+              mode="constant",
+              constant_values=-100.0,
+          )
 
-      if y_batch.shape[1] < X_batch.shape[1]:
-        y_batch = jnp.pad(
+        out = _predict_step_pytorch(
+            self.model,
+            X_batch,
             y_batch,
-            ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
-            constant_values=-100.0,
+            train_size_val,
+            ds_batch_val,
+            cat_mask_batch,
         )
+        # Slice output to keep only test predictions and unpadded batch.
+        out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
+        outputs.append(out)
+      return np.concatenate(outputs, axis=0)
 
-
-
-      if cat_mask_batch is not None and hasattr(self.model, "cell_embedder"):
-        cat_mask_batch = _pad_batch_to_multiple_of(cat_mask_batch, num_data_shards)
-        cat_mask_batch = jax.device_put(
-            jnp.array(cat_mask_batch, dtype=jnp.bool_), data_sharding
-        )
-        out = _predict_step_compiled(
-            self.model, X_batch, y_batch, train_size, d_batch, cat_mask_batch
-        )
+    else:
+      if not HAS_JAX:
+        raise ImportError("JAX is required to run a JAX model.")
+      # --- JAX execution path ---
+      mesh = jax.sharding.get_mesh()
+      if mesh and "data" in mesh.axis_names:
+        num_data_shards = mesh.axis_sizes[mesh.axis_names.index("data")]
+        data_sharding = NamedSharding(mesh, PartitionSpec("data"))
       else:
-        out = _predict_step_compiled(
-            self.model, X_batch, y_batch, train_size, d_batch
+        num_data_shards = 1
+        data_sharding = None
+
+      _has_compiled_attr = (
+          "_predict_step_compiled_with_cat"
+          if (cat_masks is not None and hasattr(self.model, "cell_embedder"))
+          else "_predict_step_compiled_no_cat"
+      )
+
+      if not hasattr(self, _has_compiled_attr):
+        if cat_masks is not None and hasattr(self.model, "cell_embedder"):
+
+          @nnx.jit(
+              in_shardings=(
+                  None,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+              ),
+              out_shardings=data_sharding,
+          )
+          def _predict_step_fn(model, X, y, train_size, d, cat_mask):
+            return model(
+                X,
+                y,
+                train_size=train_size,
+                d=d,
+                cat_mask=cat_mask,
+            )
+
+        else:
+
+          @nnx.jit(
+              in_shardings=(
+                  None,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+                  data_sharding,
+              ),
+              out_shardings=data_sharding,
+          )
+          def _predict_step_fn(model, X, y, train_size, d):
+            return model(
+                X,
+                y,
+                train_size=train_size,
+                d=d,
+            )
+
+        setattr(self, _has_compiled_attr, _predict_step_fn)
+
+      _predict_step_compiled = getattr(self, _has_compiled_attr)
+      batch_size_per_process = getattr(self, "batch_size", 1) or Xs.shape[0]
+      n_batches = math.ceil(Xs.shape[0] / batch_size_per_process)
+      if n_batches > 1:
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        if cat_masks is not None:
+          cat_masks_split = np.array_split(cat_masks, n_batches)
+        if ds is not None:
+          ds_split = np.array_split(ds, n_batches)
+      else:
+        Xs_split, ys_split = [Xs], [ys]
+        if cat_masks is not None:
+          cat_masks_split = [cat_masks]
+        if ds is not None:
+          ds_split = [ds]
+
+      outputs = []
+      cat_masks_iter = (
+          cat_masks_split if cat_masks is not None else [None] * len(Xs_split)
+      )
+      ds_iter = ds_split if ds is not None else [None] * len(Xs_split)
+      for X_batch, y_batch, cat_mask_batch, ds_batch_val in zip(
+          Xs_split, ys_split, cat_masks_iter, ds_iter
+      ):
+        orig_batch_size = X_batch.shape[0]
+        orig_seq_len = X_batch.shape[1]
+
+        # Follow prefill(): pad sequence length T (n_row) to a multiple of 128
+        # with -100. Padded rows fall past train_size and are sliced off below.
+        _block_size = 128
+        _T_full = X_batch.shape[1]
+        _pad_len = ((_T_full - 1) // _block_size + 1) * _block_size - _T_full
+        if _pad_len > 0:
+          X_batch = np.pad(
+              X_batch, ((0, 0), (0, _pad_len), (0, 0)), constant_values=-100.0
+          )
+
+        X_batch = _pad_batch_to_multiple_of(X_batch, num_data_shards)
+        y_batch = _pad_batch_to_multiple_of(y_batch, num_data_shards)
+
+        X_batch = jax.device_put(
+            jnp.array(X_batch, dtype=jnp.float32), data_sharding
+        )
+        y_batch = jax.device_put(
+            jnp.array(y_batch, dtype=jnp.float32), data_sharding
+        )
+        batch_size_padded = X_batch.shape[0]
+        train_size_val = y_batch.shape[1]
+        train_size = jax.device_put(
+            jnp.repeat(train_size_val, batch_size_padded), data_sharding
         )
 
-      out = out[:orig_batch_size, train_size_val:, :]
-      from jax.experimental import multihost_utils  # pylint: disable=g-import-not-at-top
-      out = multihost_utils.process_allgather(out, tiled=True)
-      outputs.append(out)
+        if ds_batch_val is not None:
+          ds_batch = _pad_batch_to_multiple_of(
+              ds_batch_val, num_data_shards, constant_value=X_batch.shape[-1]
+          )
+        else:
+          ds_batch = np.full(
+              (batch_size_padded,), X_batch.shape[-1], dtype=np.int32
+          )
 
-    return np.concatenate(outputs, axis=0)
+        d_batch = jax.device_put(
+            jnp.array(ds_batch, dtype=jnp.int32), data_sharding
+        )
+
+        if y_batch.shape[1] < X_batch.shape[1]:
+          y_batch = jnp.pad(
+              y_batch,
+              ((0, 0), (0, X_batch.shape[1] - y_batch.shape[1])),
+              constant_values=-100.0,
+          )
+
+        if jax.process_index() == 0:
+          logging.info("X_batch shape: %s", X_batch.shape)
+          logging.info("y_batch shape: %s", y_batch.shape)
+          logging.info("train_size: %s", train_size_val)
+
+        if cat_mask_batch is not None and hasattr(self.model, "cell_embedder"):
+          cat_mask_batch = _pad_batch_to_multiple_of(
+              cat_mask_batch, num_data_shards
+          )
+          cat_mask_batch = jax.device_put(
+              jnp.array(cat_mask_batch, dtype=jnp.bool_), data_sharding
+          )
+          out = _predict_step_compiled(
+              self.model, X_batch, y_batch, train_size, d_batch, cat_mask_batch
+          )
+        else:
+          out = _predict_step_compiled(
+              self.model, X_batch, y_batch, train_size, d_batch
+          )
+
+        out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
+        out = multihost_utils.process_allgather(out, tiled=True)
+        outputs.append(out)
+
+      return np.concatenate(outputs, axis=0)
+
+  def _inverse_transform_y(self, y_scaled: np.ndarray) -> np.ndarray:
+    """Inverse transform target values."""
+    return self.y_scaler_.inverse_transform(y_scaled.reshape(-1, 1)).flatten()
+
+  def __getstate__(self):
+    """Drops memoized compiled predict functions from the pickled state.
+
+    The first predict memoizes nnx.jit-compiled step functions on the
+    estimator (see _batch_forward). Those closures cannot be pickled; they
+    are pure caches and are rebuilt lazily on the next predict.
+    """
+    state = dict(super().__getstate__())
+    for attr in _COMPILED_PREDICT_CACHE_ATTRS:
+      state.pop(attr, None)
+    return state
 
   @jt.typed
-  def predict(self, X: Any) -> jt.Float[jax.Array | np.ndarray, "T"]:
+  def predict_oof(self, cv: int = 5) -> jt.Float[Array | np.ndarray, "E N"]:
+    """Perform out-of-fold predictions on the training set for each ensemble member."""
+    check_is_fitted(self)
+
+    outputs_oof_scaled = self._compute_oof_preds_scaled(cv=cv)
+    n_estimators, N = outputs_oof_scaled.shape
+
+    outputs_oof = np.zeros((n_estimators, N))
+    for i in range(n_estimators):
+      outputs_oof[i, :] = self._inverse_transform_y(outputs_oof_scaled[i])
+
+    return outputs_oof
+
+  def _compute_oof_preds_scaled(
+      self,
+      cv: int = 5,
+  ) -> np.ndarray:
+    """Helper to compute OOF predictions in the scaled space."""
+    check_is_fitted(self)
+
+    N = self.ensemble_generator_.X_.shape[0]
+
+    all_configs = []
+    for (
+        norm_method,
+        configs,
+    ) in self.ensemble_generator_.ensemble_configs_.items():
+      for config in configs:
+        all_configs.append((norm_method, config))
+    n_estimators = len(all_configs)
+
+    kf = KFold(n_splits=cv, shuffle=True, random_state=self.random_state)
+    # Take the number of rows from the first config if max_num_rows is given,
+    # or use N otherwise.
+    _, _, _, first_row_sub_pattern = all_configs[0][1]
+    n_rows = (
+        len(first_row_sub_pattern) if first_row_sub_pattern is not None else N
+    )
+    folds_base = list(kf.split(np.arange(n_rows)))
+
+    outputs_oof = np.zeros((n_estimators, N))
+
+    if (
+        getattr(self, "min_rows_for_single_val_split", 0) > 0
+        and len(folds_base[0][1]) >= self.min_rows_for_single_val_split
+    ):
+      folds_to_run = folds_base[:1]
+    else:
+      folds_to_run = folds_base
+
+    self.oof_val_indices_ = None
+    for fold_idx, (train_fold, val_fold) in enumerate(folds_to_run):
+      data_fold, val_indices_list = self.ensemble_generator_.transform_fold(
+          train_fold, val_fold
+      )
+      if fold_idx == 0 and len(folds_to_run) == 1:
+        self.oof_val_indices_ = val_indices_list[0]
+      (
+          Xs_batch,
+          ys_batch,
+          cat_masks_batch,
+          ds_batch,
+          _,
+      ) = self.ensemble_generator_.prepare_ensemble_tensors(data_fold)
+
+      out = self._batch_forward(
+          Xs_batch, ys_batch, cat_masks_batch, ds=ds_batch
+      )
+      _check_regressor_output_dim(out.shape[-1])
+
+      preds = out.squeeze(-1)
+
+      for i in range(n_estimators):
+        outputs_oof[i, val_indices_list[i]] = preds[i]
+
+    return outputs_oof
+
+  @jt.typed
+  def _predict_internal(self, X: Any) -> jt.Float[Array | np.ndarray, "E T"]:
+    """Predict regression target for test samples."""
+    check_is_fitted(self)
+    if isinstance(X, np.ndarray) and len(X.shape) == 1:
+      raise ValueError("The provided input X is one-dimensional. Reshape your data.")
+
+    X_transformed = self.X_encoder_.transform(X)
+    data = self.ensemble_generator_.transform(X_transformed)
+    (
+        Xs_all,
+        ys_all,
+        cat_masks_all,
+        ds_all,
+        _,
+    ) = self.ensemble_generator_.prepare_ensemble_tensors(data)
+
+    if self.member_index is not None:
+      # Run only member ``member_index`` of the (fully-generated) ensemble, so
+      # this estimator reproduces exactly that one view -- used to expose each
+      # ensemble member as a standalone model (ensembling done externally).
+      mi = self.member_index
+      Xs_all = Xs_all[mi : mi + 1]
+      ys_all = ys_all[mi : mi + 1]
+      cat_masks_all = cat_masks_all[mi : mi + 1]
+      ds_all = ds_all[mi : mi + 1]
+
+    output = self._batch_forward(Xs_all, ys_all, cat_masks_all, ds=ds_all)
+    _check_regressor_output_dim(output.shape[-1])
+    predictions = output.squeeze(-1)
+    return predictions
+
+  @jt.typed
+  def _combine_predictions(
+      self, predictions_scaled: jt.Float[Array | np.ndarray, "E T"]
+  ) -> jt.Float[Array | np.ndarray, "T"]:
+    """Combine scaled predictions from ensemble members into final prediction."""
+    n_est = predictions_scaled.shape[0]
+    if self._resolved_ensemble_method() != "mean":
+      test_preds = np.zeros((n_est, predictions_scaled.shape[1]))
+      for i in range(n_est):
+        test_preds[i, :] = self._inverse_transform_y(predictions_scaled[i])
+      return np.dot(self.ensemble_weights_, test_preds)
+    else:
+      avg_predictions = np.mean(predictions_scaled, axis=0)
+      return self._inverse_transform_y(avg_predictions)
+
+  @jt.typed
+  def predict(self, X: Any) -> jt.Float[Array | np.ndarray, "T"]:
     """Predict regression target for test samples.
 
     Applies the ensemble of TabFM models to make predictions, with each
     ensemble member providing predictions that are then averaged.
 
     Args:
-      X : array-like of shape (n_samples, n_features)
-          Test samples for prediction.
+      X: array-like of shape (n_samples, n_features). Test samples for
+        prediction.
 
     Returns:
       np.ndarray of shape (n_samples,)
           Predicted target values for each test sample.
     """
-    if isinstance(X, np.ndarray) and len(X.shape) == 1:
-      raise ValueError("The provided input X is one-dimensional. Reshape your data.")
-
-    X = self.X_encoder_.transform(X)
-    data = self.ensemble_generator_.transform(X)
-    Xs_all, ys_all, cat_masks_all = [], [], []
-    for norm_method, (Xs, ys) in data.items():
-      Xs_all.append(Xs)
-      ys_all.append(ys)
-      configs = self.ensemble_generator_.ensemble_configs_[norm_method]
-      for shuffle_pattern, _, _ in configs:
-        mask = np.zeros(self.ensemble_generator_.n_features_in_, dtype=np.bool_)
-        if hasattr(self.ensemble_generator_, "cat_features_"):
-          mask[self.ensemble_generator_.cat_features_] = True
-        cat_masks_all.append(mask[shuffle_pattern])
-
-    Xs_all = np.concatenate(Xs_all, axis=0)
-    ys_all = np.concatenate(ys_all, axis=0)
-    cat_masks_all = np.stack(cat_masks_all, axis=0)
-
-    output = self._batch_forward(Xs_all, ys_all, cat_masks_all)
-    loss = self.model.loss if hasattr(self.model, "loss") else (self.config.loss if self.config else "mse")
-    if loss == "rmse" or loss == "mse":
-      predictions = output.squeeze(-1)
-    else:
-      raise ValueError(
-          f"Unsupported loss for regression predict: {loss}"
-      )
-
-    avg_predictions = np.mean(predictions, axis=0)
-    return self.y_scaler_.inverse_transform(avg_predictions.reshape(-1, 1)).flatten()
+    predictions = self._predict_internal(X)
+    return self._combine_predictions(predictions)

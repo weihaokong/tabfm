@@ -32,13 +32,13 @@ jobs:
     # Install deps
     - uses: actions/setup-python@v5
       with:
-        python-version: "3.10"
+        python-version: "3.11"
         # Uncomment to cache of pip dependencies (if tests too slow)
         # cache: pip
         # cache-dependency-path: '**/pyproject.toml'
 
     - run: pip --version
-    - run: pip install -e .[dev]
+    - run: pip install -e .[dev,jax,pytorch]
     - run: pip freeze
 
     # Run tests (in parallel)

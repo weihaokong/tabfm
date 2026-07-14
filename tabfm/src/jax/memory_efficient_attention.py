@@ -417,10 +417,8 @@ def dot_product_attention_queries_per_head(
     if bias is not None:
       # If bias is not broadcasted yet, dynamic slice would fail with full slice
       # size. In this case we keep the bias unbroadcasted.
-      # slice_q_len = min(bias.shape[-2], query_chunk_size)
-      # slice_k_len = min(bias.shape[-1], key_chunk_size)
-      slice_q_len = 1
-      slice_k_len = key_chunk_size
+      slice_q_len = min(bias.shape[-2], query_chunk_size)
+      slice_k_len = min(bias.shape[-1], key_chunk_size)
 
       local_bias = lax.dynamic_slice(
           bias,

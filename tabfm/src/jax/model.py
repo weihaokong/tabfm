@@ -60,18 +60,51 @@ from . import memory_efficient_attention
 
 class AttentionImplementation(str, enum.Enum):
   JAX = 'jax'
-  # vmaps jax.nn.dot_product_attention over the head dimension to save memory
-  JAX_VMAP_ON_HEAD_DIM = 'jax_vmap_on_head_dim'
   FLASH = 'flash'
   NONE = 'none'
 
 
-@jt.typed
-def _round_to_multiple_of(val: int, multiple: int) -> int:
-  """Rounds a value up to the nearest multiple of 'multiple'."""
-  assert multiple > 0, f'multiple must be positive. Got {multiple}'
-  assert val >= 0, f'val must be non-negative. Got {val}'
-  return val + (multiple - val % multiple) % multiple
+# Module-level FFN chunk size (surgical, post-load knob mirroring the PyTorch
+# port's per-module ``ffn_chunk_size``). When set, ``_ff_block`` materializes its
+# ``[.., dim_feedforward]`` intermediate one token-chunk at a time, bounding peak
+# memory. Chunking is pointwise-exact (each token's FFN is independent), so the
+# output is bit-identical to the unchunked path. Set before the first predict --
+# it is read as a compile-time constant when the model is traced.
+FFN_CHUNK_SIZE = None
+
+
+def set_ffn_chunk_size(n):
+  """Set the global FFN token-chunk size (``None`` disables chunking)."""
+  global FFN_CHUNK_SIZE
+  FFN_CHUNK_SIZE = n
+
+
+# Row-chunk size for ``RowInteraction`` (mirrors the PyTorch port's
+# ``row_chunk_size``). The row transformer attends over the column axis within
+# each row, so the flattened ``B*T`` row axis is an independent batch dimension:
+# processing it ``ROW_CHUNK_SIZE`` rows at a time is exact and bounds the
+# ``[rows, heads, HC, HC]`` attention-score buffer that otherwise scales with
+# the full row count (30+ GiB on wide/tall tasks).
+ROW_CHUNK_SIZE = None
+
+
+def set_row_chunk_size(n):
+  """Set the global RowInteraction row-chunk size (``None`` disables)."""
+  global ROW_CHUNK_SIZE
+  ROW_CHUNK_SIZE = n
+
+
+# Column-chunk size for ``ColEmbedding`` (mirrors the PyTorch port's
+# ``col_chunk_size``). The column set-transformer runs with the flattened
+# ``B*HC`` column axis as its batch dimension (attention is over rows within
+# each column), so processing it ``COL_CHUNK_SIZE`` columns at a time is exact.
+COL_CHUNK_SIZE = None
+
+
+def set_col_chunk_size(n):
+  """Set the global ColEmbedding column-chunk size (``None`` disables)."""
+  global COL_CHUNK_SIZE
+  COL_CHUNK_SIZE = n
 
 
 # Rotary Embedding
@@ -371,38 +404,7 @@ class RotaryEmbedding(nnx.Module):
 
 
 # ----------------------------------------------------------------------------
-# 1. Unchanged Data Structures & Placeholders
-#
-# This section contains code that is framework-agnostic or requires a
-# user-provided implementation.
-# ----------------------------------------------------------------------------
-
-
-class ClassNode:
-  """Node in the hierarchical classification tree for handling many-class problems.
-
-  This class is framework-agnostic and remains unchanged from the original.
-  """
-
-  @jt.typed
-  def __init__(self, depth: int = 0):
-    """Initializes the ClassNode.
-
-    Args:
-      depth: Depth of the node in the tree.
-    """
-    self.depth: int = depth
-    self.is_leaf: bool = False
-    self.classes_: Optional[jt.Int[jax.Array | np.ndarray, 'K']] = None
-    self.child_nodes: list[Any] = []
-    self.class_mapping: dict[int, int] = {}
-    self.group_indices: Optional[jt.Int[jax.Array | np.ndarray, 'G']] = None
-    self.R: Optional[jt.Float[jax.Array | np.ndarray, 'B E']] = None
-    self.y: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None
-
-
-# ----------------------------------------------------------------------------
-# 2. Helper Functions
+# 1. Helper Functions
 #
 # Utility functions used by the NNX modules.
 # ----------------------------------------------------------------------------
@@ -433,7 +435,7 @@ def get_activation(activation: Union[str, Callable]) -> Callable:
 
 
 # ----------------------------------------------------------------------------
-# 3. Translated NNX Modules
+# 2. Translated NNX Modules
 #
 # flax.nnx.Module implementations.
 # ----------------------------------------------------------------------------
@@ -562,212 +564,6 @@ def _logn(n: int, dtype: jnp.dtype) -> jax.Array | np.ndarray:
   return jnp.array(math.log(max(n, 1)), dtype=dtype)
 
 
-class SSMax(nnx.Module):
-  """Scalable Softmax with learnable per-head scaling factors.
-
-  Applies scaling to queries:
-  :math:`q_{\\text{scaled}} = q \\cdot (s \\cdot \\log n)`,
-  where :math:`s` is a learnable per-head parameter.
-
-  Parameters
-  ----------
-  num_heads : int
-      Number of attention heads.
-  """
-
-  @jt.typed
-  def __init__(
-      self,
-      num_heads: int,
-      *,
-      rngs: Any,
-      dtype: DType = jnp.bfloat16,
-  ):
-    self.scales = nnx.Param(jnp.ones((num_heads,), dtype=dtype))
-
-  @jt.typed
-  def __call__(
-      self, q: jt.Float[jax.Array | np.ndarray, 'B T N D'], n: int
-  ) -> jt.Float[jax.Array | np.ndarray, 'B T N D']:
-    """Apply SSMax scaling to queries.
-
-    Args:
-      q: Query tensor after projection.
-      n: Source sequence length.
-
-    Returns:
-      Scaled query tensor.
-    """
-    logn = _logn(n, q.dtype)
-    scales = self.scales.value.reshape(1, 1, -1, 1) * logn
-    return q * scales
-
-
-class SSMaxMLP(nnx.Module):
-  """Scalable Softmax using an MLP to compute scaling factors.
-
-  Applies scaling to queries:
-  :math:`q_{\\text{scaled}} = q \\cdot \\text{mlp}(\\log n)`,
-  where the MLP learns to map sequence length to scaling factors.
-
-  Parameters
-  ----------
-  num_heads : int
-      Number of attention heads.
-
-  n_hidden : int, default=64
-      Number of hidden units in the MLP.
-
-  elementwise : bool, default=False
-      If True, apply elementwise scaling per head dimension, allowing
-      different scaling for each element in the head dimension.
-
-  head_dim : int, optional
-      Dimension of each attention head. Required if ``elementwise=True``.
-  """
-
-  @jt.typed
-  def __init__(
-      self,
-      num_heads: int,
-      n_hidden: int = 64,
-      elementwise: bool = False,
-      head_dim: Optional[int] = None,
-      *,
-      rngs: Any,
-      dtype: DType = jnp.bfloat16,
-  ):
-    self.elementwise = elementwise
-    if elementwise:
-      if head_dim is None:
-        raise ValueError('head_dim must be provided when elementwise=True')
-      out_dim = num_heads * head_dim
-    else:
-      out_dim = num_heads
-    self.l1 = nnx.Linear(1, n_hidden, rngs=rngs, dtype=dtype)
-    self.l2 = nnx.Linear(n_hidden, out_dim, rngs=rngs, dtype=dtype)
-    self.num_heads = num_heads
-
-  @jt.typed
-  def __call__(
-      self, q: jt.Float[jax.Array | np.ndarray, 'B T N D'], n: int
-  ) -> jt.Float[jax.Array | np.ndarray, 'B T N D']:
-    """Apply SSMax scaling to queries.
-
-    Args:
-      q: Query tensor after projection.
-      n: Source sequence length.
-
-    Returns:
-      Scaled query tensor.
-    """
-    logn = _logn(n, q.dtype).reshape(1, 1)
-    scales = self.l2(nnx.gelu(self.l1(logn)))
-    if self.elementwise:
-      # scales: (1, num_heads * head_dim) -> (1, 1, num_heads, head_dim)
-      head_dim = q.shape[-1]
-      scales = scales.reshape(1, 1, self.num_heads, head_dim)
-    else:
-      scales = scales.reshape(1, 1, self.num_heads, 1)
-    return q * scales
-
-
-class QASSMaxMLP(nnx.Module):
-  """Query-Aware Scalable Softmax using MLPs to compute scaling factors.
-
-  Applies scaling to queries:
-
-  .. math::
-
-      q_{\\text{scaled}} = q \\cdot \\text{base\\_mlp}(\\log n)
-      \\cdot \\big(1 + \\tanh(\\text{query\\_mlp}(q))\\big)
-
-  where the base MLP learns length-dependent scaling and the query MLP
-  learns query-dependent modulation.
-
-  Parameters
-  ----------
-  num_heads : int
-      Number of attention heads.
-
-  head_dim : int
-      Dimension of each attention head.
-
-  n_hidden : int, default=64
-      Number of hidden units in the MLPs.
-
-  elementwise : bool, default=False
-      If True, apply elementwise scaling per head dimension, allowing
-      different scaling for each element in the head dimension.
-  """
-
-  @jt.typed
-  def __init__(
-      self,
-      num_heads: int,
-      head_dim: int,
-      n_hidden: int = 64,
-      elementwise: bool = False,
-      *,
-      rngs: Any,
-      dtype: DType = jnp.bfloat16,
-  ):
-    self.num_heads = num_heads
-    self.head_dim = head_dim
-    self.elementwise = elementwise
-    self.dtype = dtype
-
-    if elementwise:
-      base_out_dim = num_heads * head_dim
-      query_out_dim = head_dim
-    else:
-      base_out_dim = num_heads
-      query_out_dim = 1
-
-    self.base_l1 = nnx.Linear(1, n_hidden, rngs=rngs, dtype=dtype)
-    self.base_l2 = nnx.Linear(n_hidden, base_out_dim, rngs=rngs, dtype=dtype)
-
-    self.query_l1 = nnx.Linear(head_dim, n_hidden, rngs=rngs, dtype=dtype)
-    # Initialize last layer with zeros
-    self.query_l2 = nnx.Linear(
-        n_hidden,
-        query_out_dim,
-        rngs=rngs,
-        dtype=dtype,
-        kernel_init=nnx.initializers.zeros,
-        bias_init=nnx.initializers.zeros,
-    )
-
-  @jt.typed
-  def __call__(
-      self, q: jt.Float[jax.Array | np.ndarray, 'B T N D'], n: int
-  ) -> jt.Float[jax.Array | np.ndarray, 'B T N D']:
-    """Apply QASSMax scaling to queries.
-
-    Args:
-      q: Query tensor after projection.
-      n: Source sequence length.
-
-    Returns:
-      Scaled query tensor.
-    """
-    logn = _logn(n, q.dtype).reshape(1, 1)
-
-    base_scales = self.base_l2(nnx.gelu(self.base_l1(logn)))
-    if self.elementwise:
-      base_scales = base_scales.reshape(1, 1, self.num_heads, self.head_dim)
-      query_out = self.query_l2(nnx.gelu(self.query_l1(q)))
-      modulation = 1 + jnp.tanh(query_out)
-    else:
-      base_scales = base_scales.reshape(1, 1, self.num_heads, 1)
-      query_out = self.query_l2(nnx.gelu(self.query_l1(q)))
-      modulation = 1 + jnp.tanh(query_out)
-
-    scales = base_scales * modulation
-
-    return q * scales
-
-
 @jt.typed
 def _extract_kv_from_cache(
     cached_kv: Tuple[jt.Float[jax.Array | np.ndarray, 'B T N D'],
@@ -807,49 +603,6 @@ def _encode_kv_into_cache(
   return (k, v)
 
 
-@jt.typed
-def create_ssmax_layer(
-    ssmax_type: str,
-    num_heads: int,
-    embed_dim: int,
-    rngs: Any,
-    dtype: DType = jnp.bfloat16,
-):
-  """Factory function to create SSMax layer based on type."""
-
-  if ssmax_type == 'none':
-    return None
-  elif ssmax_type == 'ssmax':
-    return SSMax(num_heads, rngs=rngs, dtype=dtype)
-  elif ssmax_type == 'ssmax-mlp':
-    return SSMaxMLP(num_heads, rngs=rngs, dtype=dtype)
-  elif ssmax_type == 'ssmax-mlp-elementwise':
-    return SSMaxMLP(
-        num_heads,
-        head_dim=embed_dim // num_heads,
-        elementwise=True,
-        rngs=rngs,
-        dtype=dtype,
-    )
-  elif ssmax_type == 'qassmax-mlp':
-    return QASSMaxMLP(
-        num_heads,
-        embed_dim // num_heads,
-        rngs=rngs,
-        dtype=dtype,
-    )
-  elif ssmax_type == 'qassmax-mlp-elementwise':
-    return QASSMaxMLP(
-        num_heads,
-        embed_dim // num_heads,
-        elementwise=True,
-        rngs=rngs,
-        dtype=dtype,
-    )
-  else:
-    raise ValueError(f'Unknown {ssmax_type=}')
-
-
 class MultiheadAttention(nnx.Module):
   """Enhanced multi-head attention with rotary positional embedding support.
 
@@ -866,11 +619,6 @@ class MultiheadAttention(nnx.Module):
       Number of attention heads.
   use_bias : bool, default=True
       Whether to use bias in projection layers.
-  ssmax : bool or str, default=False
-      Type of scalable softmax to use.
-      If True, equivalent to "qassmax-mlp-elementwise".
-      If False, equivalent to "none".
-      If a string, uses the specified scalable softmax type.
   rngs : nnx.Rngs
       RNGs for parameter initialization.
   """
@@ -881,7 +629,6 @@ class MultiheadAttention(nnx.Module):
       embed_dim: int,
       num_heads: int,
       attention_impl: AttentionImplementation = AttentionImplementation.JAX,
-      ssmax: Union[bool, str] = False,
       zero_out_proj_init: bool = False,
       use_bias: bool = True,
       *,
@@ -894,15 +641,6 @@ class MultiheadAttention(nnx.Module):
     self.attention_impl = attention_impl
     self.dtype = dtype
 
-    if isinstance(ssmax, bool):
-      ssmax = 'qassmax-mlp-elementwise' if ssmax else 'none'
-    self.ssmax_layer = create_ssmax_layer(
-        ssmax_type=ssmax,
-        num_heads=num_heads,
-        embed_dim=embed_dim,
-        rngs=rngs,
-        dtype=dtype,
-    )
 
     assert (
         self.head_dim * num_heads == self.embed_dim
@@ -1034,9 +772,6 @@ class MultiheadAttention(nnx.Module):
       k = self.key_ln(k)
     q = self.per_dim_scale(q)
 
-    # Apply SSMax if provided
-    if self.ssmax_layer is not None:
-      q = self.ssmax_layer(q, src_len)
 
     new_kv = _encode_kv_into_cache(k, v)
     if attn_mask is not None:
@@ -1068,30 +803,6 @@ class MultiheadAttention(nnx.Module):
           mask=attn_mask,
           scale=1.0,
       )
-    elif self.attention_impl == AttentionImplementation.JAX_VMAP_ON_HEAD_DIM:
-      if attn_mask is not None:
-        attn_mask = attn_mask[:, 0, :, :]
-      q_h = jnp.swapaxes(q, -2, 0)
-      k_h = jnp.swapaxes(k, -2, 0)
-      v_h = jnp.swapaxes(v, -2, 0)
-
-      # Define the function to apply to each head.
-      @jax.remat
-      def _attention_fn(inputs):
-        queries, keys, values = inputs
-        return jax.nn.dot_product_attention(
-            query=queries,
-            key=keys,
-            value=values,
-            mask=attn_mask,
-            scale=1.0,
-        )
-
-      # Map the attention function over the head dimension.
-      attn_output_h = jax.lax.map(_attention_fn, (q_h, k_h, v_h))
-
-      # Move the head dimension back to its original position.
-      attn_output = jnp.swapaxes(attn_output_h, 0, -2)
     else:
       raise ValueError(
           'Unsupported attention implementation: %s'
@@ -1134,7 +845,6 @@ class MultiheadAttentionBlock(nnx.Module):
       dim_feedforward: int,
       activation: str | Callable = 'gelu',
       attention_impl: AttentionImplementation = AttentionImplementation.JAX,
-      ssmax: Union[bool, str] = False,
       zero_out_proj_init: bool = False,
       use_bias: bool = True,
       *,
@@ -1147,7 +857,6 @@ class MultiheadAttentionBlock(nnx.Module):
         rngs=rngs,
         dtype=dtype,
         attention_impl=attention_impl,
-        ssmax=ssmax,
         zero_out_proj_init=zero_out_proj_init,
     )
     self.pre_attn_ln = nnx.RMSNorm(d_model, rngs=rngs, dtype=dtype)
@@ -1198,7 +907,7 @@ class MultiheadAttentionBlock(nnx.Module):
 
     self.dtype = dtype
 
-  def _ff_block(self, x: Array) -> Array:
+  def _ff_impl(self, x: Array) -> Array:
     x = self.pre_ff_ln(x)
     if getattr(self, 'activation_name', None) == 'swiglu':
       x_gate = self.linear1_gate(x)
@@ -1210,6 +919,26 @@ class MultiheadAttentionBlock(nnx.Module):
     x = self.linear2(x)
     x = self.post_ff_ln(x)
     return x
+
+  def _ff_block(self, x: Array) -> Array:
+    # ``FFN_CHUNK_SIZE`` (module-level) bounds peak memory by materializing the
+    # ``[.., dim_feedforward]`` intermediate one token-chunk at a time. The FFN
+    # is pointwise over tokens, so this is exact (bit-identical to unchunked).
+    # Like the PyTorch port, tokens are flattened across batch AND sequence
+    # before chunking -- in the row/col encoders the batch axis is the large
+    # one, so chunking only the sequence axis would never trigger.
+    n = FFN_CHUNK_SIZE
+    b, t, e = x.shape
+    if not n or b * t <= n:
+      return self._ff_impl(x)
+    flat = x.reshape(b * t, e)
+    pad = (-(b * t)) % n
+    xp = jnp.pad(flat, ((0, pad), (0, 0)))
+    n_chunks = (b * t + pad) // n
+    # Scan _ff_impl over token chunks (sequential, so peak intermediate is a
+    # single ``[n, dim_feedforward]`` block).
+    out = jax.lax.map(self._ff_impl, xp.reshape(n_chunks, n, e))
+    return out.reshape(b * t + pad, e)[: b * t].reshape(b, t, e)
 
   @jt.typed
   def __call__(
@@ -1305,7 +1034,6 @@ class InducedSelfAttentionBlock(nnx.Module):
       num_inds: int,
       activation: Union[str, Callable] = 'gelu',
       attention_impl: AttentionImplementation = AttentionImplementation.JAX,
-      ssmax: Union[bool, str] = False,
       zero_out_proj_init: bool = False,
       use_bias: bool = True,
       *,
@@ -1332,9 +1060,9 @@ class InducedSelfAttentionBlock(nnx.Module):
         'activation': activation,
         'rngs': rngs,
         'attention_impl': attention_impl,
-        'ssmax': ssmax,
         'zero_out_proj_init': zero_out_proj_init,
         'use_bias': use_bias,
+        'dtype': dtype,
     }
     self.mab1 = MultiheadAttentionBlock(**block_args)
     self.mab2 = MultiheadAttentionBlock(**block_args)
@@ -1447,7 +1175,6 @@ class Encoder(Module):
       use_rope: bool = False,
       rope_base: float = 10000,
       attention_impl: AttentionImplementation = AttentionImplementation.JAX,
-      ssmax: Union[bool, str] = False,
       zero_out_proj_init: bool = False,
       use_bias: bool = True,
       *,
@@ -1475,7 +1202,6 @@ class Encoder(Module):
           dim_feedforward=dim_feedforward,
           activation=act_fn,
           attention_impl=attention_impl,
-          ssmax=ssmax,
           zero_out_proj_init=zero_out_proj_init,
           use_bias=use_bias,
           rngs=rngs,
@@ -1663,7 +1389,6 @@ class SetTransformer(Module):
       num_inds: int = 13,
       activation: str = 'gelu',
       attention_impl: AttentionImplementation = AttentionImplementation.JAX,
-      ssmax: Union[bool, str] = False,
       zero_out_proj_init: bool = False,
       use_bias: bool = True,
       *,
@@ -1691,7 +1416,6 @@ class SetTransformer(Module):
           num_inds=num_inds,
           activation=act_fn,
           attention_impl=attention_impl,
-          ssmax=ssmax,
           zero_out_proj_init=zero_out_proj_init,
           rngs=rngs,
           use_bias=use_bias,
@@ -1982,32 +1706,19 @@ class CellEmbedder(nnx.Module):
     return jnp.stack(stacked, axis=-1)
 
   @jt.typed
-  def __call__(
+  def _cell(
       self,
       features: jt.Float[jax.Array | np.ndarray, 'B T H'],
-      y: jt.Shaped[Array, 'B T'],
-      train_size: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
-      d: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
       cat_mask: Optional[jt.Bool[jax.Array | np.ndarray, 'B H']] = None,
-  ) -> jt.Float[jax.Array | np.ndarray, 'B T H E']:
-    """Embeds the input features and target values.
+      d: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
+  ) -> jt.Float[jax.Array | np.ndarray, 'B T HC E']:
+    """Cell expansion: group features and project them to embeddings.
 
-    Args:
-      features: Input feature tensor.
-      y: Target value tensor.
-      train_size: The number of training samples for each batch element.
-      d: The number of active features for each batch element.
-      cat_mask: Boolean mask indicating categorical features.
-
-    Returns:
-      Cell embeddings.
+    Rows (T) are independent here, so callers may process them in chunks (see
+    ``ROW_CHUNK_SIZE`` in ``__call__``) -- the Fourier path materializes a
+    ``[B, T, HC, G, E]`` intermediate that dominates peak memory.
     """
-    B, T, H = features.shape
-    E = self.embed_dim
-
     features_grouped = self.feature_grouping(features, d=d)
-
-    HC = features_grouped.shape[-2]
 
     if self.use_fourier_features:
       # --- New path: Fourier feature projection ---
@@ -2048,16 +1759,62 @@ class CellEmbedder(nnx.Module):
         cat_out = self.in_linear_cat(fe_cat_fourier)  # (B, T, HC, G, E)
 
         selected = jnp.where(cat_mask_per_slot, cat_out, num_out)
-        cell_embeddings = selected.sum(axis=-2)  # (B, T, HC, E)
-      else:
-        # No cat_mask: treat all as numerical and sum across slots (or singleton).
-        cell_embeddings = num_out.sum(axis=-2)  # (B, T, HC, E)
+        return selected.sum(axis=-2)  # (B, T, HC, E)
+      # No cat_mask: treat all as numerical and sum across slots (or singleton).
+      return num_out.sum(axis=-2)  # (B, T, HC, E)
+
+    # --- Old (legacy) path: direct linear projection ---
+    # Matches the parameter tree of checkpoints trained before Fourier
+    # features were introduced. in_linear projects (in_dim -> embed_dim)
+    # directly from raw scalar/grouped values.
+    return self.in_linear(features_grouped)  # (B, T, HC, E)
+
+  def __call__(
+      self,
+      features: jt.Float[jax.Array | np.ndarray, 'B T H'],
+      y: jt.Shaped[Array, 'B T'],
+      train_size: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
+      d: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
+      cat_mask: Optional[jt.Bool[jax.Array | np.ndarray, 'B H']] = None,
+  ) -> jt.Float[jax.Array | np.ndarray, 'B T H E']:
+    """Embeds the input features and target values.
+
+    Args:
+      features: Input feature tensor.
+      y: Target value tensor.
+      train_size: The number of training samples for each batch element.
+      d: The number of active features for each batch element.
+      cat_mask: Boolean mask indicating categorical features.
+
+    Returns:
+      Cell embeddings.
+    """
+    B, T, H = features.shape
+    E = self.embed_dim
+
+    # ``ROW_CHUNK_SIZE`` (module-level, mirrors the PyTorch port) chunks the
+    # Fourier expansion over rows: ``_cell`` materializes a ``[B, T, HC, G, E]``
+    # intermediate, but rows are independent there, so slicing T is exact. The
+    # y-embedding below stays unchunked (it indexes rows globally via
+    # ``arange(T) < train_size``), matching the port.
+    n = ROW_CHUNK_SIZE
+    if not n or T <= n:
+      cell_embeddings = self._cell(features, cat_mask=cat_mask, d=d)
     else:
-      # --- Old (legacy) path: direct linear projection ---
-      # Matches the parameter tree of checkpoints trained before Fourier
-      # features were introduced. in_linear projects (in_dim -> embed_dim)
-      # directly from raw scalar/grouped values.
-      cell_embeddings = self.in_linear(features_grouped)  # (B, T, HC, E)
+      pad = (-T) % n
+      n_chunks = (T + pad) // n
+      xp = jnp.pad(features, ((0, 0), (0, pad), (0, 0)))
+      xp = jnp.moveaxis(xp.reshape(B, n_chunks, n, H), 1, 0)
+
+      @nnx.scan(in_axes=(None, 0, None, None), out_axes=0)
+      def _cell_chunks(cell_embedder, xc, cat_mask, d):
+        return cell_embedder._cell(xc, cat_mask=cat_mask, d=d)
+
+      out = _cell_chunks(self, xp, cat_mask, d)  # (n_chunks, B, n, HC, E)
+      out = jnp.moveaxis(out, 0, 1).reshape(B, T + pad, out.shape[-2], E)
+      cell_embeddings = out[:, :T]
+
+    HC = cell_embeddings.shape[-2]
 
     if self.y_embedding_scheme == YEmbeddingScheme.ADD_Y_TO_X_POST_EMBEDDING:
       if self.is_classifier:
@@ -2141,7 +1898,6 @@ class ColEmbedding(nnx.Module):
       num_inds: int,
       activation: str | Callable = 'gelu',
       attention_impl: AttentionImplementation = AttentionImplementation.JAX,
-      ssmax: Union[bool, str] = False,
       zero_out_proj_init: bool = False,
       use_bias: bool = True,
       *,
@@ -2161,7 +1917,6 @@ class ColEmbedding(nnx.Module):
         rngs=rngs,
         dtype=self.dtype,
         attention_impl=attention_impl,
-        ssmax=ssmax,
         zero_out_proj_init=zero_out_proj_init,
         use_bias=use_bias,
     )
@@ -2245,13 +2000,46 @@ class ColEmbedding(nnx.Module):
           return_inducing_repr=True,
       )
     else:                        # Train.
-      representations = typing.cast(
-          Array,
-          tf_col_st(
-              src,
-              train_size=train_size_expanded,
-          ),
-      )
+      # ``COL_CHUNK_SIZE`` (module-level, mirrors the PyTorch port's
+      # ``col_chunk_size``) processes the independent ``B*HC`` column axis in
+      # chunks. Only this plain branch is chunked -- the port has no
+      # decode/prefill paths, and those carry inducing-repr caches.
+      n = COL_CHUNK_SIZE
+      bhc = src.shape[0]
+      if not n or bhc <= n:
+        representations = typing.cast(
+            Array,
+            tf_col_st(
+                src,
+                train_size=train_size_expanded,
+            ),
+        )
+      else:
+        pad = (-bhc) % n
+        n_chunks = (bhc + pad) // n
+        sp = jnp.pad(src, ((0, pad), (0, 0), (0, 0)))
+        sp = sp.reshape(n_chunks, n, T, E)
+        if train_size_expanded is not None:
+          # Pad with T (attend to all rows) so padded columns never see an
+          # all-masked softmax; their outputs are sliced off below.
+          tp = jnp.pad(train_size_expanded, (0, pad), constant_values=T)
+          tp = tp.reshape(n_chunks, n)
+
+          @nnx.scan(in_axes=(None, 0, 0), out_axes=0)
+          def _col_chunks(tf_col, sc, tc):
+            return tf_col(sc, train_size=tc)
+
+          representations = _col_chunks(tf_col_st, sp, tp)
+        else:
+
+          @nnx.scan(in_axes=(None, 0), out_axes=0)
+          def _col_chunks(tf_col, sc):
+            return tf_col(sc, train_size=None)
+
+          representations = _col_chunks(tf_col_st, sp)
+        representations = representations.reshape(
+            (bhc + pad,) + representations.shape[2:]
+        )[:bhc]
 
     # 3. Output Projection & Normalization
     embeddings = self.ln_w(self.out_w(representations))  # (B * HC, T, E)
@@ -2352,11 +2140,49 @@ class RowInteraction(nnx.Module):
       # Expand to (B*T, 1, HC) for attention mask
       attn_mask = attn_mask[:, None, None, :]
 
-    # Process through the transformer
-    outputs = self.tf_row(
-        embeddings_reshaped,
-        attn_mask=attn_mask,
-    )
+    # Process through the transformer. ``ROW_CHUNK_SIZE`` (module-level, mirrors
+    # the PyTorch port's ``row_chunk_size``) processes the independent ``B*T``
+    # row axis in chunks: each row only attends over its own column axis, so
+    # chunking is exact and bounds the ``[rows, heads, HC, HC]`` score buffer.
+    n = ROW_CHUNK_SIZE
+    bt = B * T
+    if not n or bt <= n:
+      outputs = self.tf_row(
+          embeddings_reshaped,
+          attn_mask=attn_mask,
+      )
+    else:
+      pad = (-bt) % n
+      n_chunks = (bt + pad) // n
+      xp = jnp.pad(embeddings_reshaped, ((0, pad), (0, 0), (0, 0)))
+      xp = xp.reshape(n_chunks, n, HC, E)
+      # Scan sequentially over row chunks with ``nnx.scan`` (raw ``lax.map``
+      # cannot close over an nnx.Module -- the Encoder's internal ``nnx.scan``
+      # trips the trace-level aliasing check). The module is broadcast
+      # (``in_axes=None``); only the data axes are scanned.
+      if attn_mask is not None:
+        # Pad with True so padded rows never have an all-masked (NaN) softmax;
+        # their outputs are sliced off below.
+        mp = jnp.pad(
+            attn_mask,
+            ((0, pad), (0, 0), (0, 0), (0, 0)),
+            constant_values=True,
+        )
+        mp = mp.reshape((n_chunks, n) + attn_mask.shape[1:])
+
+        @nnx.scan(in_axes=(None, 0, 0), out_axes=0)
+        def _row_chunks(tf_row, xc, mc):
+          return tf_row(xc, attn_mask=mc)
+
+        outputs = _row_chunks(self.tf_row, xp, mp)
+      else:
+
+        @nnx.scan(in_axes=(None, 0), out_axes=0)
+        def _row_chunks(tf_row, xc):
+          return tf_row(xc, attn_mask=None)
+
+        outputs = _row_chunks(self.tf_row, xp)
+      outputs = outputs.reshape((bt + pad,) + outputs.shape[2:])[:bt]
     if self.output_full_sequence:
       outputs = self.out_ln(outputs)
 
@@ -2373,6 +2199,96 @@ class RowInteraction(nnx.Module):
     return representations
 
 
+class RetrievalDecoder(nnx.Module):
+  """Attention-based retrieval decoder for classification (TabPFN-3 style).
+
+  Treats class prediction as soft nearest-neighbor retrieval over the
+  in-context training set: final-layer train embeddings act as keys, their
+  one-hot labels as values, and the embeddings to classify act as queries.
+  After learned linear projections W_Q / W_K and scaled dot-product
+  attention, the head-averaged attention-weighted average of the one-hot
+  labels gives class probabilities, converted to logits with a clipped log
+  (constants follow TabPFN-3: ``log(clip(p, 1e-5) + 3e-5)``).
+
+  There is no value projection -- the values are the one-hot labels
+  themselves, so the output is a proper probability average per head.
+
+  Parameters
+  ----------
+  d_model : int
+      Input embedding dimension.
+  max_classes : int
+      Number of classes (one-hot value dimension).
+  head_dim : int, default=64
+      Attention head dimension (TabPFN-3 default).
+  num_heads : int, default=6
+      Number of attention heads (TabPFN-3 default).
+  rngs : nnx.Rngs
+      RNGs for parameter initialization.
+  """
+
+  @jt.typed
+  def __init__(
+      self,
+      d_model: int,
+      max_classes: int,
+      head_dim: int = 64,
+      num_heads: int = 6,
+      use_bias: bool = True,
+      *,
+      rngs: Any,
+      dtype: DType = jnp.bfloat16,
+  ):
+    self.max_classes = max_classes
+    self.head_dim = head_dim
+    self.num_heads = num_heads
+    self.dtype = dtype
+    attention_size = head_dim * num_heads
+    self.q_proj = nnx.Linear(
+        d_model, attention_size, use_bias=use_bias, rngs=rngs, dtype=dtype
+    )
+    self.k_proj = nnx.Linear(
+        d_model, attention_size, use_bias=use_bias, rngs=rngs, dtype=dtype
+    )
+
+  @jt.typed
+  def __call__(
+      self,
+      queries: jt.Float[jax.Array | np.ndarray, 'B M E'],
+      key_embeddings: jt.Float[jax.Array | np.ndarray, 'B T_keys E'],
+      key_y: jt.Int[jax.Array | np.ndarray, 'B T_keys'],
+      key_mask: jt.Bool[jax.Array | np.ndarray, 'B T_keys'],
+  ) -> jt.Float[jax.Array | np.ndarray, 'B M K']:
+    """Computes retrieval logits.
+
+    Args:
+      queries: Embeddings of the rows to classify.
+      key_embeddings: Embeddings of the in-context (train) rows.
+      key_y: Integer class labels of the in-context rows.
+      key_mask: True for real train rows; padding / test rows in the key
+        sequence must be False so they receive zero attention weight.
+
+    Returns:
+      Per-class logits (log of clipped retrieval probabilities).
+    """
+    B, M, _ = queries.shape
+    q = self.q_proj(queries).reshape(B, M, self.num_heads, self.head_dim)
+    k = self.k_proj(key_embeddings).reshape(
+        B, -1, self.num_heads, self.head_dim
+    )
+    # Attention in float32 for a stable softmax; scale = head_dim**-0.5.
+    scores = jnp.einsum(
+        'bmhd,bnhd->bhmn', q.astype(jnp.float32), k.astype(jnp.float32)
+    ) * (self.head_dim**-0.5)
+    scores = jnp.where(key_mask[:, None, None, :], scores, -1e30)
+    attn = jax.nn.softmax(scores, axis=-1)  # (B, H, M, T_keys)
+    one_hot = jax.nn.one_hot(key_y, self.max_classes, dtype=jnp.float32)
+    # Head-averaged attention-weighted average of the one-hot labels.
+    p = jnp.einsum('bhmn,bnk->bmk', attn, one_hot) / self.num_heads
+    logits = jnp.log(jnp.clip(p, 1e-5, None) + 3e-5)
+    return logits.astype(self.dtype)
+
+
 @nnx.dataclass
 class ICLearningCache:
   layer_caches: (
@@ -2383,23 +2299,25 @@ class ICLearningCache:
       ]
   )
   prefill_train_size: jt.Int[jax.Array | np.ndarray, 'B']
+  # Post-norm prefill embeddings and their labels; only stored (and needed)
+  # when the ICL decoder is the retrieval head, whose decode path retrieves
+  # against the train rows of the prefill sequence.
+  train_embeddings: Optional[jt.Float[jax.Array | np.ndarray, 'B T_prefill E']] = None
+  train_y: Optional[jt.Shaped[jax.Array | np.ndarray, 'B T_prefill']] = None
 
 
 class ICLearning(nnx.Module):
-  """Dataset-wise in-context learning with automatic hierarchical classification support.
+  """Dataset-wise in-context learning.
 
   This module is rewritten in Flax NNX and implements in-context learning that:
   1. Takes row representations and training labels as input.
   2. Conditions the model on training examples.
   3. Makes predictions for test examples based on learned patterns.
-  4. Automatically handles both small and large label spaces.
 
   parameters
   ----------
   max_classes : int
-      Number of classes that the model supports natively. If the number of
-      classes
-      in the dataset exceeds this value, hierarchical classification is used.
+      Number of classes that the model supports.
   d_model : int
       Model dimension.
   num_blocks : int
@@ -2423,11 +2341,13 @@ class ICLearning(nnx.Module):
       nhead: int,
       dim_feedforward: int,
       activation: str = 'gelu',
-      ssmax: Union[bool, str] = False,
       zero_out_proj_init: bool = False,
       attention_impl: AttentionImplementation = AttentionImplementation.JAX,
       use_bias: bool = True,
       cache_icl_input_only: bool = False,
+      decoder_type: str = 'mlp',
+      decoder_head_dim: int = 64,
+      decoder_num_heads: int = 6,
       *,
       rngs: Any | None = None,
       dtype: DType = jnp.bfloat16,
@@ -2439,6 +2359,16 @@ class ICLearning(nnx.Module):
     self.loss = loss
     self.is_classifier = self.loss == 'cross_entropy'
     self.cache_icl_input_only = cache_icl_input_only
+    if decoder_type not in ('mlp', 'retrieval'):
+      raise ValueError(
+          f"decoder_type must be 'mlp' or 'retrieval'. Got {decoder_type!r}"
+      )
+    if decoder_type == 'retrieval' and not self.is_classifier:
+      raise ValueError(
+          'The retrieval decoder is classification-only; regression must use'
+          " decoder_type='mlp'."
+      )
+    self.decoder_type = decoder_type
 
     self.tf_icl = Encoder(
         num_blocks=num_blocks,
@@ -2448,7 +2378,6 @@ class ICLearning(nnx.Module):
         activation=activation,
         use_rope=False,
         attention_impl=attention_impl,
-        ssmax=ssmax,
         zero_out_proj_init=zero_out_proj_init,
         use_bias=use_bias,
         cache_icl_input_only=cache_icl_input_only,
@@ -2460,14 +2389,24 @@ class ICLearning(nnx.Module):
       self.y_encoder = OneHotAndLinear(
           max_classes, d_model, rngs=rngs, dtype=self.dtype
       )
-      self.root: ClassNode | None = None
-      self.decoder = MLP(
-          in_dim=d_model,
-          out_dim=max_classes,
-          hidden_dims=(d_model * 2,),
-          rngs=rngs,
-          dtype=self.dtype,
-      )
+      if decoder_type == 'retrieval':
+        self.decoder = RetrievalDecoder(
+            d_model=d_model,
+            max_classes=max_classes,
+            head_dim=decoder_head_dim,
+            num_heads=decoder_num_heads,
+            use_bias=use_bias,
+            rngs=rngs,
+            dtype=self.dtype,
+        )
+      else:
+        self.decoder = MLP(
+            in_dim=d_model,
+            out_dim=max_classes,
+            hidden_dims=(d_model * 2,),
+            rngs=rngs,
+            dtype=self.dtype,
+        )
     else:
       self.y_encoder = MLP(
           in_dim=1,
@@ -2559,10 +2498,6 @@ class ICLearning(nnx.Module):
       result, new_layer_caches = self.tf_icl(
           R, attn_mask=full_attn_mask, return_kv=True
       )
-      new_cache = ICLearningCache(
-          layer_caches=new_layer_caches,
-          prefill_train_size=train_size
-      )
     else:
       assert is_decode
       assert train_size is None
@@ -2573,7 +2508,36 @@ class ICLearning(nnx.Module):
 
 
     result = self.ln(result)
-    result = self.decoder(result)
+
+    retrieval = getattr(self, 'decoder_type', 'mlp') == 'retrieval'
+    if is_prefill:
+      # The retrieval decoder's decode path retrieves against the train rows
+      # of the prefill sequence, so the (post-norm) prefill embeddings and
+      # their labels go into the cache alongside the KV caches.
+      new_cache = ICLearningCache(
+          layer_caches=new_layer_caches,
+          prefill_train_size=train_size,
+          train_embeddings=result if retrieval else None,
+          train_y=y.astype(jnp.int32) if retrieval else None,
+      )
+
+    if retrieval:
+      if is_decode:
+        assert cache.train_embeddings is not None, (
+            'Decode with the retrieval decoder requires a cache built by a'
+            ' prefill run of the same (retrieval) decoder.'
+        )
+        key_embeddings = cache.train_embeddings
+        key_y = cache.train_y
+      else:
+        key_embeddings = result
+        key_y = y.astype(jnp.int32)
+      # ``train_mask`` marks the real train rows in the key sequence: it is
+      # computed from ``train_size`` in train/prefill mode and from
+      # ``cache.prefill_train_size`` in decode mode.
+      result = self.decoder(result, key_embeddings, key_y, train_mask)
+    else:
+      result = self.decoder(result)
     if return_cache:
       assert new_cache is not None
       return result, new_cache
@@ -2595,17 +2559,12 @@ class TabFM(nnx.Module):
   3. Dataset-wise in-context learning learns patterns from labeled examples and
   makes predictions.
 
-  For datasets with more than `max_classes` classes, TabFM switches to
-  hierarchical classification
-  to recursively partition classes into subgroups, forming a multi-level
-  classification tree.
+  Datasets with more than `max_classes` classes are not supported.
 
   Parameters
   ----------
   max_classes : int, default=10
-      Number of classes that the model supports natively. If the number of
-      classes
-      in the dataset exceeds this value, hierarchical classification is used.
+      Number of classes that the model supports.
   embed_dim : int, default=128
       Model dimension used in the column/row embedding transformers. For the
       in-context
@@ -2648,9 +2607,6 @@ class TabFM(nnx.Module):
       shifts.
   feature_group_size : int, default=3
       The number of features in each group when feature_group is not False.
-  ssmax : bool or str, default=False
-      Type of scalable softmax to use. Options: "none", "ssmax", "ssmax-mlp",
-      "ssmax-mlp-elementwise", "qassmax-mlp", "qassmax-mlp-elementwise".
   col_attention_impl : AttentionImplementation, default=AttentionImplementation.JAX
       Which attention implementation to use for column embedding.
   row_attention_impl : AttentionImplementation, default=AttentionImplementation.JAX
@@ -2691,7 +2647,6 @@ class TabFM(nnx.Module):
       y_embedding_scheme: YEmbeddingScheme = YEmbeddingScheme.NONE,
       y_col_embedder_encoder_nhid: int = 6,
       cache_icl_input_only: bool = False,
-      ssmax: Union[bool, str] = False,
       zero_out_proj_init: bool = False,
       use_bias: bool = True,
       feature_group: Union[bool, str] = False,
@@ -2699,6 +2654,9 @@ class TabFM(nnx.Module):
       use_fourier_features: bool = True,
       fourier_features_num_frequencies: int = 32,
       fourier_features_sigma: float = 1.0,
+      icl_decoder_type: str = 'mlp',
+      decoder_head_dim: int = 64,
+      decoder_num_heads: int = 6,
       *,
       rngs: Any,
       dtype: DType = jnp.bfloat16,
@@ -2742,7 +2700,6 @@ class TabFM(nnx.Module):
         rngs=rngs,
         dtype=self.dtype,
         attention_impl=col_attention_impl,
-        ssmax=ssmax,
         zero_out_proj_init=zero_out_proj_init,
         use_bias=use_bias,
     )
@@ -2756,7 +2713,6 @@ class TabFM(nnx.Module):
         rngs=rngs,
         dtype=self.dtype,
         attention_impl=col_attention_impl,
-        ssmax=ssmax,
         zero_out_proj_init=zero_out_proj_init,
         use_bias=use_bias,
     )
@@ -2804,11 +2760,13 @@ class TabFM(nnx.Module):
         activation=activation,
         rngs=rngs,
         dtype=self.dtype,
-        ssmax=ssmax,
         zero_out_proj_init=zero_out_proj_init,
         attention_impl=icl_attention_impl,
         use_bias=use_bias,
         cache_icl_input_only=cache_icl_input_only,
+        decoder_type=icl_decoder_type,
+        decoder_head_dim=decoder_head_dim,
+        decoder_num_heads=decoder_num_heads,
     )
     self.y_embedding_scheme = y_embedding_scheme
 
@@ -2895,14 +2853,20 @@ class TabFM(nnx.Module):
         d=d,
     )
 
-    if self.is_classifier and num_classes is not None and num_classes > self.icl_predictor.max_classes:
-      raise NotImplementedError('Hierarchical classification is not supported')
-    else:
-      out = self.icl_predictor(
-          representations,
-          y,
-          train_size=train_size,
+    if (
+        self.is_classifier
+        and num_classes is not None
+        and num_classes > self.icl_predictor.max_classes
+    ):
+      raise ValueError(
+          f'Number of classes ({num_classes}) exceeds the maximum supported '
+          f'({self.icl_predictor.max_classes}).'
       )
+    out = self.icl_predictor(
+        representations,
+        y,
+        train_size=train_size,
+    )
 
     return out
 
