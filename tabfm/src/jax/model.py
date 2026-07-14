@@ -60,10 +60,51 @@ from . import memory_efficient_attention
 
 class AttentionImplementation(str, enum.Enum):
   JAX = 'jax'
-  # vmaps jax.nn.dot_product_attention over the head dimension to save memory
-  JAX_VMAP_ON_HEAD_DIM = 'jax_vmap_on_head_dim'
   FLASH = 'flash'
   NONE = 'none'
+
+
+# Module-level FFN chunk size (surgical, post-load knob mirroring the PyTorch
+# port's per-module ``ffn_chunk_size``). When set, ``_ff_block`` materializes its
+# ``[.., dim_feedforward]`` intermediate one token-chunk at a time, bounding peak
+# memory. Chunking is pointwise-exact (each token's FFN is independent), so the
+# output is bit-identical to the unchunked path. Set before the first predict --
+# it is read as a compile-time constant when the model is traced.
+FFN_CHUNK_SIZE = None
+
+
+def set_ffn_chunk_size(n):
+  """Set the global FFN token-chunk size (``None`` disables chunking)."""
+  global FFN_CHUNK_SIZE
+  FFN_CHUNK_SIZE = n
+
+
+# Row-chunk size for ``RowInteraction`` (mirrors the PyTorch port's
+# ``row_chunk_size``). The row transformer attends over the column axis within
+# each row, so the flattened ``B*T`` row axis is an independent batch dimension:
+# processing it ``ROW_CHUNK_SIZE`` rows at a time is exact and bounds the
+# ``[rows, heads, HC, HC]`` attention-score buffer that otherwise scales with
+# the full row count (30+ GiB on wide/tall tasks).
+ROW_CHUNK_SIZE = None
+
+
+def set_row_chunk_size(n):
+  """Set the global RowInteraction row-chunk size (``None`` disables)."""
+  global ROW_CHUNK_SIZE
+  ROW_CHUNK_SIZE = n
+
+
+# Column-chunk size for ``ColEmbedding`` (mirrors the PyTorch port's
+# ``col_chunk_size``). The column set-transformer runs with the flattened
+# ``B*HC`` column axis as its batch dimension (attention is over rows within
+# each column), so processing it ``COL_CHUNK_SIZE`` columns at a time is exact.
+COL_CHUNK_SIZE = None
+
+
+def set_col_chunk_size(n):
+  """Set the global ColEmbedding column-chunk size (``None`` disables)."""
+  global COL_CHUNK_SIZE
+  COL_CHUNK_SIZE = n
 
 
 # Rotary Embedding
@@ -762,30 +803,6 @@ class MultiheadAttention(nnx.Module):
           mask=attn_mask,
           scale=1.0,
       )
-    elif self.attention_impl == AttentionImplementation.JAX_VMAP_ON_HEAD_DIM:
-      if attn_mask is not None:
-        attn_mask = attn_mask[:, 0, :, :]
-      q_h = jnp.swapaxes(q, -2, 0)
-      k_h = jnp.swapaxes(k, -2, 0)
-      v_h = jnp.swapaxes(v, -2, 0)
-
-      # Define the function to apply to each head.
-      @jax.remat
-      def _attention_fn(inputs):
-        queries, keys, values = inputs
-        return jax.nn.dot_product_attention(
-            query=queries,
-            key=keys,
-            value=values,
-            mask=attn_mask,
-            scale=1.0,
-        )
-
-      # Map the attention function over the head dimension.
-      attn_output_h = jax.lax.map(_attention_fn, (q_h, k_h, v_h))
-
-      # Move the head dimension back to its original position.
-      attn_output = jnp.swapaxes(attn_output_h, 0, -2)
     else:
       raise ValueError(
           'Unsupported attention implementation: %s'
@@ -890,7 +907,7 @@ class MultiheadAttentionBlock(nnx.Module):
 
     self.dtype = dtype
 
-  def _ff_block(self, x: Array) -> Array:
+  def _ff_impl(self, x: Array) -> Array:
     x = self.pre_ff_ln(x)
     if getattr(self, 'activation_name', None) == 'swiglu':
       x_gate = self.linear1_gate(x)
@@ -902,6 +919,26 @@ class MultiheadAttentionBlock(nnx.Module):
     x = self.linear2(x)
     x = self.post_ff_ln(x)
     return x
+
+  def _ff_block(self, x: Array) -> Array:
+    # ``FFN_CHUNK_SIZE`` (module-level) bounds peak memory by materializing the
+    # ``[.., dim_feedforward]`` intermediate one token-chunk at a time. The FFN
+    # is pointwise over tokens, so this is exact (bit-identical to unchunked).
+    # Like the PyTorch port, tokens are flattened across batch AND sequence
+    # before chunking -- in the row/col encoders the batch axis is the large
+    # one, so chunking only the sequence axis would never trigger.
+    n = FFN_CHUNK_SIZE
+    b, t, e = x.shape
+    if not n or b * t <= n:
+      return self._ff_impl(x)
+    flat = x.reshape(b * t, e)
+    pad = (-(b * t)) % n
+    xp = jnp.pad(flat, ((0, pad), (0, 0)))
+    n_chunks = (b * t + pad) // n
+    # Scan _ff_impl over token chunks (sequential, so peak intermediate is a
+    # single ``[n, dim_feedforward]`` block).
+    out = jax.lax.map(self._ff_impl, xp.reshape(n_chunks, n, e))
+    return out.reshape(b * t + pad, e)[: b * t].reshape(b, t, e)
 
   @jt.typed
   def __call__(
@@ -1669,32 +1706,19 @@ class CellEmbedder(nnx.Module):
     return jnp.stack(stacked, axis=-1)
 
   @jt.typed
-  def __call__(
+  def _cell(
       self,
       features: jt.Float[jax.Array | np.ndarray, 'B T H'],
-      y: jt.Shaped[Array, 'B T'],
-      train_size: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
-      d: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
       cat_mask: Optional[jt.Bool[jax.Array | np.ndarray, 'B H']] = None,
-  ) -> jt.Float[jax.Array | np.ndarray, 'B T H E']:
-    """Embeds the input features and target values.
+      d: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
+  ) -> jt.Float[jax.Array | np.ndarray, 'B T HC E']:
+    """Cell expansion: group features and project them to embeddings.
 
-    Args:
-      features: Input feature tensor.
-      y: Target value tensor.
-      train_size: The number of training samples for each batch element.
-      d: The number of active features for each batch element.
-      cat_mask: Boolean mask indicating categorical features.
-
-    Returns:
-      Cell embeddings.
+    Rows (T) are independent here, so callers may process them in chunks (see
+    ``ROW_CHUNK_SIZE`` in ``__call__``) -- the Fourier path materializes a
+    ``[B, T, HC, G, E]`` intermediate that dominates peak memory.
     """
-    B, T, H = features.shape
-    E = self.embed_dim
-
     features_grouped = self.feature_grouping(features, d=d)
-
-    HC = features_grouped.shape[-2]
 
     if self.use_fourier_features:
       # --- New path: Fourier feature projection ---
@@ -1735,16 +1759,62 @@ class CellEmbedder(nnx.Module):
         cat_out = self.in_linear_cat(fe_cat_fourier)  # (B, T, HC, G, E)
 
         selected = jnp.where(cat_mask_per_slot, cat_out, num_out)
-        cell_embeddings = selected.sum(axis=-2)  # (B, T, HC, E)
-      else:
-        # No cat_mask: treat all as numerical and sum across slots (or singleton).
-        cell_embeddings = num_out.sum(axis=-2)  # (B, T, HC, E)
+        return selected.sum(axis=-2)  # (B, T, HC, E)
+      # No cat_mask: treat all as numerical and sum across slots (or singleton).
+      return num_out.sum(axis=-2)  # (B, T, HC, E)
+
+    # --- Old (legacy) path: direct linear projection ---
+    # Matches the parameter tree of checkpoints trained before Fourier
+    # features were introduced. in_linear projects (in_dim -> embed_dim)
+    # directly from raw scalar/grouped values.
+    return self.in_linear(features_grouped)  # (B, T, HC, E)
+
+  def __call__(
+      self,
+      features: jt.Float[jax.Array | np.ndarray, 'B T H'],
+      y: jt.Shaped[Array, 'B T'],
+      train_size: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
+      d: Optional[jt.Int[jax.Array | np.ndarray, 'B']] = None,
+      cat_mask: Optional[jt.Bool[jax.Array | np.ndarray, 'B H']] = None,
+  ) -> jt.Float[jax.Array | np.ndarray, 'B T H E']:
+    """Embeds the input features and target values.
+
+    Args:
+      features: Input feature tensor.
+      y: Target value tensor.
+      train_size: The number of training samples for each batch element.
+      d: The number of active features for each batch element.
+      cat_mask: Boolean mask indicating categorical features.
+
+    Returns:
+      Cell embeddings.
+    """
+    B, T, H = features.shape
+    E = self.embed_dim
+
+    # ``ROW_CHUNK_SIZE`` (module-level, mirrors the PyTorch port) chunks the
+    # Fourier expansion over rows: ``_cell`` materializes a ``[B, T, HC, G, E]``
+    # intermediate, but rows are independent there, so slicing T is exact. The
+    # y-embedding below stays unchunked (it indexes rows globally via
+    # ``arange(T) < train_size``), matching the port.
+    n = ROW_CHUNK_SIZE
+    if not n or T <= n:
+      cell_embeddings = self._cell(features, cat_mask=cat_mask, d=d)
     else:
-      # --- Old (legacy) path: direct linear projection ---
-      # Matches the parameter tree of checkpoints trained before Fourier
-      # features were introduced. in_linear projects (in_dim -> embed_dim)
-      # directly from raw scalar/grouped values.
-      cell_embeddings = self.in_linear(features_grouped)  # (B, T, HC, E)
+      pad = (-T) % n
+      n_chunks = (T + pad) // n
+      xp = jnp.pad(features, ((0, 0), (0, pad), (0, 0)))
+      xp = jnp.moveaxis(xp.reshape(B, n_chunks, n, H), 1, 0)
+
+      @nnx.scan(in_axes=(None, 0, None, None), out_axes=0)
+      def _cell_chunks(cell_embedder, xc, cat_mask, d):
+        return cell_embedder._cell(xc, cat_mask=cat_mask, d=d)
+
+      out = _cell_chunks(self, xp, cat_mask, d)  # (n_chunks, B, n, HC, E)
+      out = jnp.moveaxis(out, 0, 1).reshape(B, T + pad, out.shape[-2], E)
+      cell_embeddings = out[:, :T]
+
+    HC = cell_embeddings.shape[-2]
 
     if self.y_embedding_scheme == YEmbeddingScheme.ADD_Y_TO_X_POST_EMBEDDING:
       if self.is_classifier:
@@ -1930,13 +2000,46 @@ class ColEmbedding(nnx.Module):
           return_inducing_repr=True,
       )
     else:                        # Train.
-      representations = typing.cast(
-          Array,
-          tf_col_st(
-              src,
-              train_size=train_size_expanded,
-          ),
-      )
+      # ``COL_CHUNK_SIZE`` (module-level, mirrors the PyTorch port's
+      # ``col_chunk_size``) processes the independent ``B*HC`` column axis in
+      # chunks. Only this plain branch is chunked -- the port has no
+      # decode/prefill paths, and those carry inducing-repr caches.
+      n = COL_CHUNK_SIZE
+      bhc = src.shape[0]
+      if not n or bhc <= n:
+        representations = typing.cast(
+            Array,
+            tf_col_st(
+                src,
+                train_size=train_size_expanded,
+            ),
+        )
+      else:
+        pad = (-bhc) % n
+        n_chunks = (bhc + pad) // n
+        sp = jnp.pad(src, ((0, pad), (0, 0), (0, 0)))
+        sp = sp.reshape(n_chunks, n, T, E)
+        if train_size_expanded is not None:
+          # Pad with T (attend to all rows) so padded columns never see an
+          # all-masked softmax; their outputs are sliced off below.
+          tp = jnp.pad(train_size_expanded, (0, pad), constant_values=T)
+          tp = tp.reshape(n_chunks, n)
+
+          @nnx.scan(in_axes=(None, 0, 0), out_axes=0)
+          def _col_chunks(tf_col, sc, tc):
+            return tf_col(sc, train_size=tc)
+
+          representations = _col_chunks(tf_col_st, sp, tp)
+        else:
+
+          @nnx.scan(in_axes=(None, 0), out_axes=0)
+          def _col_chunks(tf_col, sc):
+            return tf_col(sc, train_size=None)
+
+          representations = _col_chunks(tf_col_st, sp)
+        representations = representations.reshape(
+            (bhc + pad,) + representations.shape[2:]
+        )[:bhc]
 
     # 3. Output Projection & Normalization
     embeddings = self.ln_w(self.out_w(representations))  # (B * HC, T, E)
@@ -2037,11 +2140,49 @@ class RowInteraction(nnx.Module):
       # Expand to (B*T, 1, HC) for attention mask
       attn_mask = attn_mask[:, None, None, :]
 
-    # Process through the transformer
-    outputs = self.tf_row(
-        embeddings_reshaped,
-        attn_mask=attn_mask,
-    )
+    # Process through the transformer. ``ROW_CHUNK_SIZE`` (module-level, mirrors
+    # the PyTorch port's ``row_chunk_size``) processes the independent ``B*T``
+    # row axis in chunks: each row only attends over its own column axis, so
+    # chunking is exact and bounds the ``[rows, heads, HC, HC]`` score buffer.
+    n = ROW_CHUNK_SIZE
+    bt = B * T
+    if not n or bt <= n:
+      outputs = self.tf_row(
+          embeddings_reshaped,
+          attn_mask=attn_mask,
+      )
+    else:
+      pad = (-bt) % n
+      n_chunks = (bt + pad) // n
+      xp = jnp.pad(embeddings_reshaped, ((0, pad), (0, 0), (0, 0)))
+      xp = xp.reshape(n_chunks, n, HC, E)
+      # Scan sequentially over row chunks with ``nnx.scan`` (raw ``lax.map``
+      # cannot close over an nnx.Module -- the Encoder's internal ``nnx.scan``
+      # trips the trace-level aliasing check). The module is broadcast
+      # (``in_axes=None``); only the data axes are scanned.
+      if attn_mask is not None:
+        # Pad with True so padded rows never have an all-masked (NaN) softmax;
+        # their outputs are sliced off below.
+        mp = jnp.pad(
+            attn_mask,
+            ((0, pad), (0, 0), (0, 0), (0, 0)),
+            constant_values=True,
+        )
+        mp = mp.reshape((n_chunks, n) + attn_mask.shape[1:])
+
+        @nnx.scan(in_axes=(None, 0, 0), out_axes=0)
+        def _row_chunks(tf_row, xc, mc):
+          return tf_row(xc, attn_mask=mc)
+
+        outputs = _row_chunks(self.tf_row, xp, mp)
+      else:
+
+        @nnx.scan(in_axes=(None, 0), out_axes=0)
+        def _row_chunks(tf_row, xc):
+          return tf_row(xc, attn_mask=None)
+
+        outputs = _row_chunks(self.tf_row, xp)
+      outputs = outputs.reshape((bt + pad,) + outputs.shape[2:])[:bt]
     if self.output_full_sequence:
       outputs = self.out_ln(outputs)
 
