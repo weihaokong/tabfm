@@ -2199,6 +2199,96 @@ class RowInteraction(nnx.Module):
     return representations
 
 
+class RetrievalDecoder(nnx.Module):
+  """Attention-based retrieval decoder for classification (TabPFN-3 style).
+
+  Treats class prediction as soft nearest-neighbor retrieval over the
+  in-context training set: final-layer train embeddings act as keys, their
+  one-hot labels as values, and the embeddings to classify act as queries.
+  After learned linear projections W_Q / W_K and scaled dot-product
+  attention, the head-averaged attention-weighted average of the one-hot
+  labels gives class probabilities, converted to logits with a clipped log
+  (constants follow TabPFN-3: ``log(clip(p, 1e-5) + 3e-5)``).
+
+  There is no value projection -- the values are the one-hot labels
+  themselves, so the output is a proper probability average per head.
+
+  Parameters
+  ----------
+  d_model : int
+      Input embedding dimension.
+  max_classes : int
+      Number of classes (one-hot value dimension).
+  head_dim : int, default=64
+      Attention head dimension (TabPFN-3 default).
+  num_heads : int, default=6
+      Number of attention heads (TabPFN-3 default).
+  rngs : nnx.Rngs
+      RNGs for parameter initialization.
+  """
+
+  @jt.typed
+  def __init__(
+      self,
+      d_model: int,
+      max_classes: int,
+      head_dim: int = 64,
+      num_heads: int = 6,
+      use_bias: bool = True,
+      *,
+      rngs: Any,
+      dtype: DType = jnp.bfloat16,
+  ):
+    self.max_classes = max_classes
+    self.head_dim = head_dim
+    self.num_heads = num_heads
+    self.dtype = dtype
+    attention_size = head_dim * num_heads
+    self.q_proj = nnx.Linear(
+        d_model, attention_size, use_bias=use_bias, rngs=rngs, dtype=dtype
+    )
+    self.k_proj = nnx.Linear(
+        d_model, attention_size, use_bias=use_bias, rngs=rngs, dtype=dtype
+    )
+
+  @jt.typed
+  def __call__(
+      self,
+      queries: jt.Float[jax.Array | np.ndarray, 'B M E'],
+      key_embeddings: jt.Float[jax.Array | np.ndarray, 'B T_keys E'],
+      key_y: jt.Int[jax.Array | np.ndarray, 'B T_keys'],
+      key_mask: jt.Bool[jax.Array | np.ndarray, 'B T_keys'],
+  ) -> jt.Float[jax.Array | np.ndarray, 'B M K']:
+    """Computes retrieval logits.
+
+    Args:
+      queries: Embeddings of the rows to classify.
+      key_embeddings: Embeddings of the in-context (train) rows.
+      key_y: Integer class labels of the in-context rows.
+      key_mask: True for real train rows; padding / test rows in the key
+        sequence must be False so they receive zero attention weight.
+
+    Returns:
+      Per-class logits (log of clipped retrieval probabilities).
+    """
+    B, M, _ = queries.shape
+    q = self.q_proj(queries).reshape(B, M, self.num_heads, self.head_dim)
+    k = self.k_proj(key_embeddings).reshape(
+        B, -1, self.num_heads, self.head_dim
+    )
+    # Attention in float32 for a stable softmax; scale = head_dim**-0.5.
+    scores = jnp.einsum(
+        'bmhd,bnhd->bhmn', q.astype(jnp.float32), k.astype(jnp.float32)
+    ) * (self.head_dim**-0.5)
+    scores = jnp.where(key_mask[:, None, None, :], scores, -1e30)
+    attn = jax.nn.softmax(scores, axis=-1)  # (B, H, M, T_keys)
+    one_hot = jax.nn.one_hot(key_y, self.max_classes, dtype=jnp.float32)
+    # Head-averaged attention-weighted average of the one-hot labels.
+    p = jnp.einsum('bhmn,bnk->bmk', attn, one_hot) / self.num_heads
+    logits = jnp.log(jnp.clip(p, 1e-5, None) + 3e-5)
+    return logits.astype(self.dtype)
+
+
 @nnx.dataclass
 class ICLearningCache:
   layer_caches: (
@@ -2209,6 +2299,11 @@ class ICLearningCache:
       ]
   )
   prefill_train_size: jt.Int[jax.Array | np.ndarray, 'B']
+  # Post-norm prefill embeddings and their labels; only stored (and needed)
+  # when the ICL decoder is the retrieval head, whose decode path retrieves
+  # against the train rows of the prefill sequence.
+  train_embeddings: Optional[jt.Float[jax.Array | np.ndarray, 'B T_prefill E']] = None
+  train_y: Optional[jt.Shaped[jax.Array | np.ndarray, 'B T_prefill']] = None
 
 
 class ICLearning(nnx.Module):
@@ -2250,6 +2345,9 @@ class ICLearning(nnx.Module):
       attention_impl: AttentionImplementation = AttentionImplementation.JAX,
       use_bias: bool = True,
       cache_icl_input_only: bool = False,
+      decoder_type: str = 'mlp',
+      decoder_head_dim: int = 64,
+      decoder_num_heads: int = 6,
       *,
       rngs: Any | None = None,
       dtype: DType = jnp.bfloat16,
@@ -2261,6 +2359,16 @@ class ICLearning(nnx.Module):
     self.loss = loss
     self.is_classifier = self.loss == 'cross_entropy'
     self.cache_icl_input_only = cache_icl_input_only
+    if decoder_type not in ('mlp', 'retrieval'):
+      raise ValueError(
+          f"decoder_type must be 'mlp' or 'retrieval'. Got {decoder_type!r}"
+      )
+    if decoder_type == 'retrieval' and not self.is_classifier:
+      raise ValueError(
+          'The retrieval decoder is classification-only; regression must use'
+          " decoder_type='mlp'."
+      )
+    self.decoder_type = decoder_type
 
     self.tf_icl = Encoder(
         num_blocks=num_blocks,
@@ -2281,13 +2389,24 @@ class ICLearning(nnx.Module):
       self.y_encoder = OneHotAndLinear(
           max_classes, d_model, rngs=rngs, dtype=self.dtype
       )
-      self.decoder = MLP(
-          in_dim=d_model,
-          out_dim=max_classes,
-          hidden_dims=(d_model * 2,),
-          rngs=rngs,
-          dtype=self.dtype,
-      )
+      if decoder_type == 'retrieval':
+        self.decoder = RetrievalDecoder(
+            d_model=d_model,
+            max_classes=max_classes,
+            head_dim=decoder_head_dim,
+            num_heads=decoder_num_heads,
+            use_bias=use_bias,
+            rngs=rngs,
+            dtype=self.dtype,
+        )
+      else:
+        self.decoder = MLP(
+            in_dim=d_model,
+            out_dim=max_classes,
+            hidden_dims=(d_model * 2,),
+            rngs=rngs,
+            dtype=self.dtype,
+        )
     else:
       self.y_encoder = MLP(
           in_dim=1,
@@ -2379,10 +2498,6 @@ class ICLearning(nnx.Module):
       result, new_layer_caches = self.tf_icl(
           R, attn_mask=full_attn_mask, return_kv=True
       )
-      new_cache = ICLearningCache(
-          layer_caches=new_layer_caches,
-          prefill_train_size=train_size
-      )
     else:
       assert is_decode
       assert train_size is None
@@ -2393,7 +2508,36 @@ class ICLearning(nnx.Module):
 
 
     result = self.ln(result)
-    result = self.decoder(result)
+
+    retrieval = getattr(self, 'decoder_type', 'mlp') == 'retrieval'
+    if is_prefill:
+      # The retrieval decoder's decode path retrieves against the train rows
+      # of the prefill sequence, so the (post-norm) prefill embeddings and
+      # their labels go into the cache alongside the KV caches.
+      new_cache = ICLearningCache(
+          layer_caches=new_layer_caches,
+          prefill_train_size=train_size,
+          train_embeddings=result if retrieval else None,
+          train_y=y.astype(jnp.int32) if retrieval else None,
+      )
+
+    if retrieval:
+      if is_decode:
+        assert cache.train_embeddings is not None, (
+            'Decode with the retrieval decoder requires a cache built by a'
+            ' prefill run of the same (retrieval) decoder.'
+        )
+        key_embeddings = cache.train_embeddings
+        key_y = cache.train_y
+      else:
+        key_embeddings = result
+        key_y = y.astype(jnp.int32)
+      # ``train_mask`` marks the real train rows in the key sequence: it is
+      # computed from ``train_size`` in train/prefill mode and from
+      # ``cache.prefill_train_size`` in decode mode.
+      result = self.decoder(result, key_embeddings, key_y, train_mask)
+    else:
+      result = self.decoder(result)
     if return_cache:
       assert new_cache is not None
       return result, new_cache
@@ -2510,6 +2654,9 @@ class TabFM(nnx.Module):
       use_fourier_features: bool = True,
       fourier_features_num_frequencies: int = 32,
       fourier_features_sigma: float = 1.0,
+      icl_decoder_type: str = 'mlp',
+      decoder_head_dim: int = 64,
+      decoder_num_heads: int = 6,
       *,
       rngs: Any,
       dtype: DType = jnp.bfloat16,
@@ -2617,6 +2764,9 @@ class TabFM(nnx.Module):
         attention_impl=icl_attention_impl,
         use_bias=use_bias,
         cache_icl_input_only=cache_icl_input_only,
+        decoder_type=icl_decoder_type,
+        decoder_head_dim=decoder_head_dim,
+        decoder_num_heads=decoder_num_heads,
     )
     self.y_embedding_scheme = y_embedding_scheme
 
