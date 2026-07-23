@@ -42,6 +42,10 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
   local devices with `jax.shard_map` (log-sum-exp-combined induced attention
   scanned in key chunks; bias-masked K/V gathers for the ICL blocks), with
   the same `predict` / `predict_proba` API.
+* JAX backend: `AttentionImplementation.SPLASH` ('splash') -- fused Pallas
+  splash-attention kernel for TPU inference (the TPU analogue of 'cudnn'):
+  fp32 softmax accumulation, key-prefix masks expressed via segment ids.
+  CPU-testable via `set_splash_interpret(True)` (Pallas interpret mode).
 * JAX backend: `AttentionImplementation.CUDNN` ('cudnn') -- fused cuDNN flash
   attention for GPU inference. Boolean prefix masks are translated to cuDNN's
   variable sequence-length support, so no `[T, T_src]` mask materializes.

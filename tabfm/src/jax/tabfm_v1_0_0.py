@@ -255,7 +255,8 @@ def load(
       'flash', or 'cudnn'). 'flash' is the chunked memory-efficient path
       (runs anywhere); 'cudnn' uses the fused cuDNN flash kernel (GPU only,
       fp16/bf16, much faster on long sequences; head dims > 128 -- e.g. the
-      v1.0.0 ICL stage's 256 -- require a Hopper-or-later GPU).
+      v1.0.0 ICL stage's 256 -- require a Hopper-or-later GPU). 'splash'
+      uses the fused Pallas splash-attention kernel (TPU only).
     row_attention_impl: Attention impl for row-attention layers.
     icl_attention_impl: Attention impl for ICL layers.
     dtype: JAX compute dtype.
