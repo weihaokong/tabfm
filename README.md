@@ -158,7 +158,12 @@ preds = seqpar.predict(reg, X_test)  # collective call; every rank returns preds
 ```
 
 `seqpar.predict_proba` is the classification equivalent. A runnable script is
-provided in [examples/seqpar_regression_example.py](examples/seqpar_regression_example.py). A 1M-row context fits
+provided in [examples/seqpar_regression_example.py](examples/seqpar_regression_example.py).
+
+The JAX backend has an equivalent, `tabfm.src.jax.seqpar`: a single process
+shards the rows across all local devices with `jax.shard_map`, with the same
+`seqpar.predict(reg, X_test)` / `seqpar.predict_proba(clf, X_test)` API (no
+`torchrun` needed). A 1M-row context fits
 in ~35GB/GPU on 4 devices (a single 80GB device cannot run it at all), and at
 single-device-feasible sizes the sharded path is ~5x faster on 4 GPUs.
 

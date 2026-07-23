@@ -37,6 +37,11 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
   (e.g. a 1M-row context on 4x80GB at ~35GB/GPU). `seqpar.predict` /
   `seqpar.predict_proba` mirror the estimators' own prediction paths for any
   `n_estimators`.
+* JAX backend: `tabfm.src.jax.seqpar` -- the same sequence-parallel
+  inference for the JAX backend: a single process shards the rows across all
+  local devices with `jax.shard_map` (log-sum-exp-combined induced attention
+  scanned in key chunks; bias-masked K/V gathers for the ICL blocks), with
+  the same `predict` / `predict_proba` API.
 * JAX backend: `AttentionImplementation.CUDNN` ('cudnn') -- fused cuDNN flash
   attention for GPU inference. Boolean prefix masks are translated to cuDNN's
   variable sequence-length support, so no `[T, T_src]` mask materializes.
