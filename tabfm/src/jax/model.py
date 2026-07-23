@@ -63,6 +63,12 @@ class AttentionImplementation(str, enum.Enum):
   # vmaps jax.nn.dot_product_attention over the head dimension to save memory
   JAX_VMAP_ON_HEAD_DIM = 'jax_vmap_on_head_dim'
   FLASH = 'flash'
+  # Fused cuDNN flash attention (GPU only, fp16/bf16). Much faster than FLASH
+  # on long sequences; masks must be key-prefix (padding) masks, which is the
+  # only mask shape TabFM uses. Head dims > 128 need Hopper (sm90) or later --
+  # TabFM v1.0.0's ICL stage uses head dim 256, so 'cudnn' for the ICL layers
+  # requires an H100-class GPU (cuDNN raises NotImplementedError otherwise).
+  CUDNN = 'cudnn'
   NONE = 'none'
 
 
@@ -753,6 +759,32 @@ class MultiheadAttention(nnx.Module):
           dtype=dtype,
           query_chunk_size=128 if tgt_len >= 128 else tgt_len,
           key_chunk_size=128 if src_len >= 128 else src_len,
+      )
+    elif self.attention_impl == AttentionImplementation.CUDNN:
+      # Fused cuDNN flash attention: never materializes the [T, T_src] score
+      # matrix and runs orders of magnitude faster than the chunked FLASH
+      # path on long sequences (e.g. 24 ICL blocks at 135k-row context:
+      # ~137s -> ~1.6s on an H100).
+      #
+      # cuDNN cannot take TabFM's broadcastable boolean masks (it requires a
+      # full [B, N, T, T_src] mask, which would materialize T*T_src bools).
+      # Every mask in this model is a key-prefix (padding) mask -- "attend to
+      # the first n keys" -- so it maps exactly onto cuDNN's variable
+      # sequence-length support instead.
+      kv_seq_lens = None
+      if attn_mask is not None:
+        kv_seq_lens = (
+            attn_mask.reshape(batch_size, -1)[:, -src_len:]
+            .sum(-1)
+            .astype(jnp.int32)
+        )
+      attn_output = jax.nn.dot_product_attention(
+          query=q,
+          key=k,
+          value=v,
+          scale=1.0,
+          key_value_seq_lengths=kv_seq_lens,
+          implementation='cudnn',
       )
     elif self.attention_impl == AttentionImplementation.JAX:
       attn_output = jax.nn.dot_product_attention(
