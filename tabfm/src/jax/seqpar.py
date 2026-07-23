@@ -42,6 +42,14 @@ forward and apply the same ensemble combination as the estimators' own
 prediction paths. Device blocks are padded to a common 128-multiple length
 (the chunked-attention granularity), so unequal shards are supported; the
 padded rows are masked out of every attention and trimmed from the output.
+
+Multi-process (e.g. multi-host TPU slice) runs are supported: initialize the
+runtime with ``jax.distributed.initialize()`` first, then run the same
+program on every process -- ``fit`` (deterministic given ``random_state``)
+and ``predict`` are called on all processes, and every process returns the
+full predictions. Input shards are assembled per process with
+``jax.make_array_from_callback`` and the (tiny) output is re-replicated
+across devices so it is readable everywhere.
 """
 
 import numpy as np
@@ -267,6 +275,9 @@ def _member_outputs(estimator, X, mesh):
   has_cat = cat_masks is not None
   has_d = ds is not None
   fwd = _make_forward(graphdef, c_blk, t_blk, has_cat, has_d)
+  # The output is re-replicated across all devices so that every process of a
+  # multi-process (e.g. multi-host TPU) run can read it back directly; the
+  # gathered tensor is tiny ([1, W * t_blk, L]).
   sharded = jax.jit(
       jax.shard_map(
           fwd,
@@ -281,13 +292,22 @@ def _member_outputs(estimator, X, mesh):
           ),
           out_specs=P(None, _AXIS, None),
           check_vma=False,
-      )
+      ),
+      out_shardings=NamedSharding(mesh, P()),
   )
 
   x_shard = NamedSharding(mesh, P(None, _AXIS, None))
   y_shard = NamedSharding(mesh, P(None, _AXIS))
   ts_shard = NamedSharding(mesh, P(_AXIS))
   repl = NamedSharding(mesh, P())
+
+  def to_global(arr, sharding):
+    # Every process holds the full host copy (fit is deterministic, so all
+    # processes computed identical tensors); each contributes the slices its
+    # addressable devices need. Works identically in single-process runs.
+    return jax.make_array_from_callback(
+        arr.shape, sharding, lambda idx: arr[idx]
+    )
 
   outs = []
   for mi in range(n_members):
@@ -304,16 +324,16 @@ def _member_outputs(estimator, X, mesh):
       ts_g[r] = c1 - c0
     args = (
         state,
-        jax.device_put(xg, x_shard),
-        jax.device_put(yg, y_shard),
-        jax.device_put(ts_g, ts_shard),
-        jax.device_put(
+        to_global(xg, x_shard),
+        to_global(yg, y_shard),
+        to_global(ts_g, ts_shard),
+        to_global(
             np.asarray(cat_masks[mi : mi + 1])
             if has_cat
             else np.zeros((1, h), bool),
             repl,
         ),
-        jax.device_put(
+        to_global(
             np.asarray(ds[mi : mi + 1], np.int32)
             if has_d
             else np.zeros((1,), np.int32),
@@ -322,7 +342,7 @@ def _member_outputs(estimator, X, mesh):
     )
     out = np.asarray(
         jax.block_until_ready(sharded(*args)), np.float32
-    )  # [1, W*t_blk, L]
+    )  # [1, W*t_blk, L]; fully replicated, so readable from any process
     parts = [
         out[0, r * t_blk : r * t_blk + (t1 - t0)]
         for r, (t0, t1) in enumerate(bounds_t)

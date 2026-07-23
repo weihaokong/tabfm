@@ -30,10 +30,16 @@ from absl.testing import parameterized
 import numpy as np
 
 try:
+  import jax
   import jax.numpy as jnp
   from flax import nnx
   from tabfm.src.jax import model as tabfm_model
   from tabfm.src.jax import seqpar
+
+  # Full-precision fp32 matmuls so the comparison against the single-device
+  # path stays within tolerance on GPU dev machines too (XLA otherwise uses
+  # TF32 for float32 matmuls on Ampere+).
+  jax.config.update("jax_default_matmul_precision", "highest")
 
   HAS_JAX = True
 except ImportError:
