@@ -21,6 +21,19 @@ To release a new version (e.g. from `1.0.0` -> `2.0.0`):
 
 -->
 
+## [Unreleased]
+
+### Added
+
+* PyTorch backend: `tabfm.src.pytorch.seqpar` -- sequence-parallel (row-
+  sharded) multi-GPU inference under `torch.distributed`. Shards one ensemble
+  member's in-context rows across ranks with exact cross-rank attention
+  (log-sum-exp-combined induced attention; all-gathered context K/V for the
+  ICL blocks), enabling contexts that exceed a single device's memory
+  (e.g. a 1M-row context on 4x80GB at ~35GB/GPU). `seqpar.predict` /
+  `seqpar.predict_proba` mirror the estimators' own prediction paths for any
+  `n_estimators`.
+
 ## [1.0.1] - 2026-07-09
 
 ### Fixed
