@@ -26,9 +26,15 @@ import numpy as np
 def main():
   p = argparse.ArgumentParser()
   p.add_argument("--fold0", action="store_true")
+  p.add_argument("--distributed", action="store_true",
+                 help="multi-host slice: join the distributed runtime "
+                      "(run this script on every worker simultaneously)")
   args = p.parse_args()
 
   import jax
+
+  if args.distributed:
+    jax.distributed.initialize()  # Cloud TPU: coordinator auto-detected
   import tabfm
   from tabfm.src.jax import seqpar
 
