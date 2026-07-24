@@ -134,6 +134,14 @@ def main():
            "axis comes back n_estimators * process_count)",
   )
   ap.add_argument(
+      "--batch-size",
+      type=int,
+      default=None,
+      help="ensemble members per forward pass. The library default is 1, so "
+           "the ensemble preset runs 32 sequential single-member passes; this "
+           "is also why the 'data' mesh axis has nothing to shard.",
+  )
+  ap.add_argument(
       "--seqpar",
       action="store_true",
       help="predict via tabfm.src.jax.seqpar (explicitly sharded over the "
@@ -209,6 +217,8 @@ def main():
       kwargs = {"model": model, "random_state": SEED}
       if args.n_estimators is not None:
         kwargs["n_estimators"] = args.n_estimators
+      if args.batch_size is not None:
+        kwargs["batch_size"] = args.batch_size
       reg = builders[name](**kwargs)
       t = time.time()
       if args.seqpar:
