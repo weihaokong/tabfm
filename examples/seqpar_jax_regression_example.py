@@ -65,6 +65,11 @@ def run_example(model=None) -> np.ndarray:
 
   # Sharded predict: same fitted estimator, same ensemble combination as
   # ``reg.predict`` -- only the forward pass is sharded across devices.
+  # With no ``mesh`` argument, seqpar builds its default 1-D mesh over ALL
+  # visible devices (axis "seqpar_rows"), i.e. these two calls are equivalent:
+  #   seqpar.predict(reg, X_test)
+  #   seqpar.predict(reg, X_test, mesh=jax.sharding.Mesh(devs, ("seqpar_rows",)))
+  # where ``devs`` is jax.devices() ordered by (process_index, id).
   preds = seqpar.predict(reg, X_test)
 
   # 2-D grid + splash kernel (uncomment on a TPU with >= 4 devices):

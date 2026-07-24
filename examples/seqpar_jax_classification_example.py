@@ -55,7 +55,9 @@ def run_example(model=None) -> np.ndarray:
 
   clf.fit(X_train, y_train)
 
-  # Sharded predict_proba; columns follow ``clf.classes_``.
+  # Sharded predict_proba; columns follow ``clf.classes_``. As in the
+  # regression example, omitting ``mesh`` uses seqpar's default 1-D mesh over
+  # all visible devices.
   probs = seqpar.predict_proba(clf, X_test)
   return probs
 
