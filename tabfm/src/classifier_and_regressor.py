@@ -2905,7 +2905,9 @@ class TabFMClassifier(ClassifierMixin, BaseEstimator):
 
         # Slice output to keep only test predictions and unpadded batch.
         out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
-        out = multihost_utils.process_allgather(out, tiled=True)
+        # See the regressor's _batch_forward: gather only if actually sharded.
+        if data_sharding is not None:
+          out = multihost_utils.process_allgather(out, tiled=True)
         outputs.append(out)
 
       return np.concatenate(outputs, axis=0)
@@ -3783,7 +3785,12 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
           )
 
         out = out[:orig_batch_size, train_size_val:orig_seq_len, :]
-        out = multihost_utils.process_allgather(out, tiled=True)
+        # Only gather when the batch was actually sharded across processes. With
+        # no "data" mesh axis, data_sharding is None and every process computed
+        # the *full* batch redundantly, so a tiled allgather would concatenate
+        # process_count copies and inflate the ensemble-member axis.
+        if data_sharding is not None:
+          out = multihost_utils.process_allgather(out, tiled=True)
         outputs.append(out)
 
       return np.concatenate(outputs, axis=0)
