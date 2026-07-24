@@ -142,6 +142,14 @@ def main():
            "is also why the 'data' mesh axis has nothing to shard.",
   )
   ap.add_argument(
+      "--data-shards",
+      type=int,
+      default=None,
+      help="with --seqpar, use a 2-D (data x seqpar) mesh: this many members "
+           "run concurrently across the data axis, each sequence-sharded over "
+           "the remaining devices. Must divide the device count.",
+  )
+  ap.add_argument(
       "--seqpar",
       action="store_true",
       help="predict via tabfm.src.jax.seqpar (explicitly sharded over the "
@@ -204,7 +212,15 @@ def main():
     from tabfm.src.jax import seqpar  # pylint: disable=g-import-not-at-top
 
     reg.fit(x_train, y_train)
-    pred = np.asarray(seqpar.predict(reg, x_test), dtype=float).ravel()
+    if args.data_shards is not None:
+      # 2-D mesh: members batched over the data axis, sequence over seqpar.
+      mesh_2d = seqpar.make_mesh_2d(args.data_shards)
+      emit(f"seqpar 2-D mesh: data={args.data_shards} "
+           f"seqpar={len(jax.devices()) // args.data_shards}")
+      pred = np.asarray(seqpar.predict(reg, x_test, mesh=mesh_2d),
+                        dtype=float).ravel()
+    else:
+      pred = np.asarray(seqpar.predict(reg, x_test), dtype=float).ravel()
     return (
         mean_squared_error(y_test, pred) ** 0.5,
         r2_score(y_test, pred),

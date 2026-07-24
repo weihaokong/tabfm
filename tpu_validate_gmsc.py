@@ -67,6 +67,12 @@ def main():
       "--mode", choices=("both", "stock", "seqpar"), default="both",
       help="which prediction path(s) to time",
   )
+  ap.add_argument(
+      "--data-shards", type=int, default=None,
+      help="use a 2-D (data x seqpar) mesh for the seqpar path: this many "
+           "members run concurrently across the data axis, each "
+           "sequence-sharded over the remaining devices",
+  )
   args = ap.parse_args()
 
   import jax  # pylint: disable=g-import-not-at-top
@@ -141,7 +147,13 @@ def main():
   if args.mode in ("both", "stock"):
     run("stock", lambda: clf.predict_proba(x_test))
   if args.mode in ("both", "seqpar"):
-    run("seqpar", lambda: seqpar.predict_proba(clf, x_test))
+    if args.data_shards is not None:
+      mesh_2d = seqpar.make_mesh_2d(args.data_shards)
+      emit(f"seqpar 2-D mesh: data={args.data_shards} "
+           f"seqpar={len(devs) // args.data_shards}")
+      run("seqpar", lambda: seqpar.predict_proba(clf, x_test, mesh=mesh_2d))
+    else:
+      run("seqpar", lambda: seqpar.predict_proba(clf, x_test))
 
   if results.get("stock", (None,))[0] is not None and (
       results.get("seqpar", (None,))[0] is not None
