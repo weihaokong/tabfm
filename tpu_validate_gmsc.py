@@ -68,8 +68,9 @@ def main():
       help="which prediction path(s) to time",
   )
   ap.add_argument(
-      "--splash", action="store_true",
-      help="use the fused Pallas splash kernel for the sharded ICL attention",
+      "--splash", action=argparse.BooleanOptionalAction, default=None,
+      help="attention kernel: unset = auto (splash on TPU, mea elsewhere); "
+           "--splash / --no-splash force",
   )
   ap.add_argument(
       "--data-shards", type=int, default=None,

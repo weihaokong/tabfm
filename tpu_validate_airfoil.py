@@ -151,9 +151,11 @@ def main():
   )
   ap.add_argument(
       "--splash",
-      action="store_true",
-      help="with --seqpar, use the fused Pallas splash-attention kernel for "
-           "the sharded ICL attention instead of memory-efficient attention",
+      action=argparse.BooleanOptionalAction,
+      default=None,
+      help="attention kernel for the sharded ICL attention: default (unset) "
+           "auto-selects splash on TPU / mea elsewhere; --splash forces "
+           "splash, --no-splash forces mea (e.g. for benchmarking)",
   )
   ap.add_argument(
       "--seqpar",

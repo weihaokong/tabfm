@@ -566,17 +566,35 @@ def make_mesh_2d(data_shards):
   return jax.sharding.Mesh(grid, (_AXIS_DATA, _AXIS))
 
 
-def predict(estimator, X, mesh=None, splash=False):
-  """Sharded equivalent of ``TabFMRegressor.predict``."""
-  outputs = _member_outputs(estimator, X, mesh or _default_mesh(),
-                            splash=splash)
+def _resolve_splash(splash, mesh):
+  """None -> auto: splash on TPU (where the Pallas kernel runs), mea elsewhere."""
+  if splash is None:
+    return mesh.devices.flat[0].platform == "tpu"
+  return splash
+
+
+def predict(estimator, X, mesh=None, splash=None):
+  """Sharded equivalent of ``TabFMRegressor.predict``.
+
+  ``splash=None`` (default) auto-selects the attention kernel: the fused
+  Pallas splash kernel on TPU, memory-efficient attention elsewhere. Pass
+  True/False to force.
+  """
+  mesh = mesh or _default_mesh()
+  outputs = _member_outputs(estimator, X, mesh,
+                            splash=_resolve_splash(splash, mesh))
   return estimator._combine_predictions(outputs.squeeze(-1))  # pylint: disable=protected-access
 
 
-def predict_proba(estimator, X, mesh=None, splash=False):
-  """Sharded equivalent of ``TabFMClassifier.predict_proba``."""
-  outputs = _member_outputs(estimator, X, mesh or _default_mesh(),
-                            splash=splash)
+def predict_proba(estimator, X, mesh=None, splash=None):
+  """Sharded equivalent of ``TabFMClassifier.predict_proba``.
+
+  ``splash=None`` (default) auto-selects the attention kernel, as in
+  :func:`predict`.
+  """
+  mesh = mesh or _default_mesh()
+  outputs = _member_outputs(estimator, X, mesh,
+                            splash=_resolve_splash(splash, mesh))
   outputs = outputs[..., : estimator.n_classes_]
   offsets = []
   for offs in estimator.ensemble_generator_.class_shift_offsets_.values():

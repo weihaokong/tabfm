@@ -30,9 +30,9 @@ Optional knobs shown below:
     ensemble members run concurrently, each sequence-sharded over the
     remaining ``device_count // D`` devices. ``D`` must divide the device
     count. Omit for the 1-D default (one member at a time over all devices).
-  * ``splash=True`` -- use the fused Pallas splash-attention kernel for the
-    sharded ICL attention (TPU only; the default memory-efficient attention
-    also runs on CPU/GPU).
+  * ``splash`` -- attention kernel for the sharded ICL attention. The
+    default (``None``) auto-selects: the fused Pallas splash kernel on TPU,
+    memory-efficient attention on CPU/GPU. Pass True/False to force.
 """
 
 import numpy as np
@@ -72,9 +72,10 @@ def run_example(model=None) -> np.ndarray:
   # where ``devs`` is jax.devices() ordered by (process_index, id).
   preds = seqpar.predict(reg, X_test)
 
-  # 2-D grid + splash kernel (uncomment on a TPU with >= 4 devices):
+  # On TPU the splash kernel is already selected automatically. 2-D grid
+  # (uncomment on a TPU with >= 4 devices):
   #   mesh = seqpar.make_mesh_2d(2)  # 2 members at a time, seq over the rest
-  #   preds = seqpar.predict(reg, X_test, mesh=mesh, splash=True)
+  #   preds = seqpar.predict(reg, X_test, mesh=mesh)
   return preds
 
 
