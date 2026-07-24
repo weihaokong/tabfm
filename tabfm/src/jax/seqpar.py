@@ -177,8 +177,16 @@ def _col_sharded(col, emb, c_blk, ts_local):
   return out.reshape(b, hc, t, e).transpose((0, 2, 1, 3))
 
 
-def _icl_block_sharded(blk, r, c_blk, key_bias):
-  """One ICL self-attention block; keys = all devices' context blocks."""
+def _icl_block_sharded(blk, r, c_blk, key_bias, splash_valid=None):
+  """One ICL self-attention block; keys = all devices' context blocks.
+
+  With ``splash_valid`` (bool ``[world * c_blk]`` key-validity vector) the
+  fused Pallas splash kernel is used instead of memory-efficient attention.
+  The sharding structure is identical either way -- local queries, all-gathered
+  KV -- only the local attention kernel changes. Both kernels apply no internal
+  scaling (mea follows the T5 convention with ``rescale_logits=False``; splash
+  scales nothing), so the pre-scaled q gives identical math.
+  """
   attn = blk.attn
   nh, hd = attn.num_heads, attn.head_dim
   xn = blk.pre_attn_ln(r)
@@ -190,22 +198,59 @@ def _icl_block_sharded(blk, r, c_blk, key_bias):
   key = jax.lax.all_gather(k, _AXIS, axis=1, tiled=True)
   val = jax.lax.all_gather(v, _AXIS, axis=1, tiled=True)
   tgt = q.shape[1]
-  ao = mea.dot_product_attention_multihead(
-      query=q,
-      key=key,
-      value=val,
-      bias=key_bias,
-      dtype=np.dtype(r.dtype.name),
-      enable_dropout=False,
-      query_chunk_size=_PAD if tgt >= _PAD else tgt,
-      key_chunk_size=_PAD,
-  )
+  if splash_valid is not None:
+    # Key-prefix validity as segment ids, exactly as model.py's SPLASH branch:
+    # queries carry segment 1, valid keys 1, padded keys 0; splash attends only
+    # within equal segments. Sequence lengths here are 128-multiples (c_blk is
+    # a _MAB1_KEY_CHUNK multiple, t_blk a _PAD multiple), so 128 blocks divide.
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel as _sak  # pylint: disable=g-import-not-at-top
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as _sam  # pylint: disable=g-import-not-at-top
+
+    src = key.shape[1]
+
+    def _blk(n, cap=512):
+      # Largest power-of-two block <= cap that divides n (lengths here are
+      # always 128-multiples). Larger blocks shrink the kernel's block-metadata
+      # tables in smem -- at 2-D mesh shapes (4x longer per-device sequences)
+      # fixed 128 blocks overflow the 1MB smem budget.
+      b = 128
+      while b * 2 <= cap and n % (b * 2) == 0:
+        b *= 2
+      return min(b, n)
+
+    kernel = _sak.make_splash_mha(
+        _sam.MultiHeadMask([_sam.FullMask((tgt, src))] * nh),
+        block_sizes=_sak.BlockSizes(block_q=_blk(tgt), block_kv=_blk(src)),
+        head_shards=1,
+        q_seq_shards=1,
+    )
+    ao = kernel(
+        q[0].transpose(1, 0, 2),  # splash takes [num_heads, seq, head_dim]
+        key[0].transpose(1, 0, 2),
+        val[0].transpose(1, 0, 2),
+        segment_ids=_sak.SegmentIds(
+            q=jnp.ones((tgt,), jnp.int32),
+            kv=splash_valid.astype(jnp.int32),
+        ),
+    ).transpose(1, 0, 2)[None]
+  else:
+    ao = mea.dot_product_attention_multihead(
+        query=q,
+        key=key,
+        value=val,
+        bias=key_bias,
+        dtype=np.dtype(r.dtype.name),
+        enable_dropout=False,
+        query_chunk_size=_PAD if tgt >= _PAD else tgt,
+        key_chunk_size=_PAD,
+    )
   o = attn.out_proj(ao.reshape(1, -1, nh * hd))
   x = r + blk.post_attn_ln(o)
   return x + blk._ff_block(x)  # pylint: disable=protected-access
 
 
-def _make_forward(graphdef, c_blk, t_blk, has_cat, has_d, two_d=False):
+def _make_forward(graphdef, c_blk, t_blk, has_cat, has_d, two_d=False,
+                  splash=False):
   """Builds the per-device shard_map body for one ensemble member.
 
   With ``two_d=True`` the mesh has a second ``data`` axis (members batched
@@ -248,7 +293,9 @@ def _make_forward(graphdef, c_blk, t_blk, has_cat, has_d, two_d=False):
     valid = (jnp.arange(c_blk)[None, :] < ts_all[:, None]).reshape(-1)
     key_bias = jnp.where(valid, 0.0, -1e30)[None, None, None, :]
     for blk in _iter_blocks(icl.tf_icl.blocks):
-      r = _icl_block_sharded(blk, r, c_blk, key_bias)
+      r = _icl_block_sharded(
+          blk, r, c_blk, key_bias, splash_valid=valid if splash else None
+      )
     out = icl.decoder(icl.ln(r))  # [1, T_local, L]
     return out[:, c_blk:, :]  # [1, t_blk, L]
 
@@ -258,7 +305,7 @@ def _make_forward(graphdef, c_blk, t_blk, has_cat, has_d, two_d=False):
 _AXIS_DATA = "data"
 
 
-def _member_outputs_2d(estimator, X, mesh):
+def _member_outputs_2d(estimator, X, mesh, splash=False):
   """2-D (data x seqpar) variant of :func:`_member_outputs`.
 
   The mesh has axes ``("data", _AXIS)`` of sizes ``D`` and ``S`` (D*S = world).
@@ -298,7 +345,8 @@ def _member_outputs_2d(estimator, X, mesh):
     state = jax.device_put(state, NamedSharding(mesh, P()))
   has_cat = cat_masks is not None
   has_d = ds is not None
-  fwd = _make_forward(graphdef, c_blk, t_blk, has_cat, has_d, two_d=True)
+  fwd = _make_forward(graphdef, c_blk, t_blk, has_cat, has_d, two_d=True,
+                      splash=splash)
 
   sharded = jax.jit(
       jax.shard_map(
@@ -374,13 +422,13 @@ def _member_outputs_2d(estimator, X, mesh):
   return np.stack(outs, axis=0)
 
 
-def _member_outputs(estimator, X, mesh):
+def _member_outputs(estimator, X, mesh, splash=False):
   """Runs every ensemble member through the sharded forward.
 
   Returns ``[n_members, n_test, L_out]`` float32 outputs.
   """
   if _AXIS_DATA in mesh.axis_names:
-    return _member_outputs_2d(estimator, X, mesh)
+    return _member_outputs_2d(estimator, X, mesh, splash=splash)
   x_enc = estimator.X_encoder_.transform(X)
   data = estimator.ensemble_generator_.transform(x_enc)
   xs, ys, cat_masks, ds, _ = (
@@ -413,7 +461,7 @@ def _member_outputs(estimator, X, mesh):
     state = jax.device_put(state, NamedSharding(mesh, P()))
   has_cat = cat_masks is not None
   has_d = ds is not None
-  fwd = _make_forward(graphdef, c_blk, t_blk, has_cat, has_d)
+  fwd = _make_forward(graphdef, c_blk, t_blk, has_cat, has_d, splash=splash)
   # The output is re-replicated across all devices so that every process of a
   # multi-process (e.g. multi-host TPU) run can read it back directly; the
   # gathered tensor is tiny ([1, W * t_blk, L]).
@@ -518,15 +566,17 @@ def make_mesh_2d(data_shards):
   return jax.sharding.Mesh(grid, (_AXIS_DATA, _AXIS))
 
 
-def predict(estimator, X, mesh=None):
+def predict(estimator, X, mesh=None, splash=False):
   """Sharded equivalent of ``TabFMRegressor.predict``."""
-  outputs = _member_outputs(estimator, X, mesh or _default_mesh())
+  outputs = _member_outputs(estimator, X, mesh or _default_mesh(),
+                            splash=splash)
   return estimator._combine_predictions(outputs.squeeze(-1))  # pylint: disable=protected-access
 
 
-def predict_proba(estimator, X, mesh=None):
+def predict_proba(estimator, X, mesh=None, splash=False):
   """Sharded equivalent of ``TabFMClassifier.predict_proba``."""
-  outputs = _member_outputs(estimator, X, mesh or _default_mesh())
+  outputs = _member_outputs(estimator, X, mesh or _default_mesh(),
+                            splash=splash)
   outputs = outputs[..., : estimator.n_classes_]
   offsets = []
   for offs in estimator.ensemble_generator_.class_shift_offsets_.values():

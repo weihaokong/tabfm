@@ -68,6 +68,10 @@ def main():
       help="which prediction path(s) to time",
   )
   ap.add_argument(
+      "--splash", action="store_true",
+      help="use the fused Pallas splash kernel for the sharded ICL attention",
+  )
+  ap.add_argument(
       "--data-shards", type=int, default=None,
       help="use a 2-D (data x seqpar) mesh for the seqpar path: this many "
            "members run concurrently across the data axis, each "
@@ -151,9 +155,11 @@ def main():
       mesh_2d = seqpar.make_mesh_2d(args.data_shards)
       emit(f"seqpar 2-D mesh: data={args.data_shards} "
            f"seqpar={len(devs) // args.data_shards}")
-      run("seqpar", lambda: seqpar.predict_proba(clf, x_test, mesh=mesh_2d))
+      run("seqpar", lambda: seqpar.predict_proba(
+          clf, x_test, mesh=mesh_2d, splash=args.splash))
     else:
-      run("seqpar", lambda: seqpar.predict_proba(clf, x_test))
+      run("seqpar",
+          lambda: seqpar.predict_proba(clf, x_test, splash=args.splash))
 
   if results.get("stock", (None,))[0] is not None and (
       results.get("seqpar", (None,))[0] is not None

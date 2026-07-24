@@ -150,6 +150,12 @@ def main():
            "the remaining devices. Must divide the device count.",
   )
   ap.add_argument(
+      "--splash",
+      action="store_true",
+      help="with --seqpar, use the fused Pallas splash-attention kernel for "
+           "the sharded ICL attention instead of memory-efficient attention",
+  )
+  ap.add_argument(
       "--seqpar",
       action="store_true",
       help="predict via tabfm.src.jax.seqpar (explicitly sharded over the "
@@ -217,10 +223,12 @@ def main():
       mesh_2d = seqpar.make_mesh_2d(args.data_shards)
       emit(f"seqpar 2-D mesh: data={args.data_shards} "
            f"seqpar={len(jax.devices()) // args.data_shards}")
-      pred = np.asarray(seqpar.predict(reg, x_test, mesh=mesh_2d),
-                        dtype=float).ravel()
+      pred = np.asarray(
+          seqpar.predict(reg, x_test, mesh=mesh_2d, splash=args.splash),
+          dtype=float).ravel()
     else:
-      pred = np.asarray(seqpar.predict(reg, x_test), dtype=float).ravel()
+      pred = np.asarray(seqpar.predict(reg, x_test, splash=args.splash),
+                        dtype=float).ravel()
     return (
         mean_squared_error(y_test, pred) ** 0.5,
         r2_score(y_test, pred),
