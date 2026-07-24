@@ -14,9 +14,8 @@ pod initialisation waiting for its peers. Launch with:
   gcloud compute tpus tpu-vm ssh tabfm-mh --zone=us-central1-a --worker=all \
     --command="~/tabfm-venv/bin/python ~/tabfm/tpu_validate_airfoil.py"
 
-USE SINGLE-HOST. The stock ``predict()`` path is NOT multi-process safe, so
-``--distributed`` across a 4-host slice fails (measured, see below). Run one
-host with the local chips only::
+Multi-host works as of the _batch_forward allgather fix (see CHANGELOG below).
+For a single-host run on one worker of a multi-host slice, use::
 
     TPU_PROCESS_BOUNDS=1,1,1 TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 \
     TPU_HOST_BOUNDS=1,1,1 TPU_WORKER_ID=0 TPU_WORKER_HOSTNAMES=localhost \
@@ -224,18 +223,31 @@ def main():
   if args.mesh:
     # Auto axis types keep sharding inference implicit; the Explicit default in
     # jax 0.10 would push sharding-in-types through tabfm's jitted predict step.
-    mesh = jax.make_mesh(
-        (len(devs),), ("data",), axis_types=(jax.sharding.AxisType.Auto,)
-    )
+    # Order devices so each host's local chips are contiguous in the 1-D mesh.
+    # jax.make_mesh's default flat order interleaves hosts, and pjit rejects
+    # host-local inputs unless one host's devices form a contiguous subcube.
+    ordered = sorted(devs, key=lambda d: (d.process_index, d.id))
+    mesh = jax.sharding.Mesh(np.array(ordered, dtype=object), ("data",))
     # Setting a mesh only makes classifier_and_regressor shard the *data*; the
     # params stay on device 0 and jit then rejects the mismatch. Replicate the
     # model state across the mesh first, exactly as seqpar.predict does
     # (tabfm/src/jax/seqpar.py: device_put(state, NamedSharding(mesh, P()))).
     from flax import nnx  # pylint: disable=g-import-not-at-top
+    from jax.experimental import multihost_utils  # pylint: disable=g-import-not-at-top
     from jax.sharding import NamedSharding, PartitionSpec  # pylint: disable=g-import-not-at-top, g-multiple-import
 
     graphdef, state = nnx.split(model)
-    state = jax.device_put(state, NamedSharding(mesh, PartitionSpec()))
+    if jax.process_count() > 1:
+      # device_put cannot move a process-local array onto a sharding spanning
+      # all global devices ("CopyArrays only supports destination device list
+      # of the same size as the array device lists"). Every process holds an
+      # identical full copy of the params, so lift them to a globally
+      # replicated array instead.
+      state = multihost_utils.host_local_array_to_global_array(
+          state, mesh, PartitionSpec()
+      )
+    else:
+      state = jax.device_put(state, NamedSharding(mesh, PartitionSpec()))
     model = nnx.merge(graphdef, state)  # score_all() reads this via closure
     emit(f"mesh: data={len(devs)} (sharded batch path, params replicated)")
     with jax.sharding.set_mesh(mesh):

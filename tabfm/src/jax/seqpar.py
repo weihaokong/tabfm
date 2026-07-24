@@ -55,6 +55,7 @@ across devices so it is readable everywhere.
 import numpy as np
 
 import jax
+from jax.experimental import multihost_utils
 import jax.numpy as jnp
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -271,7 +272,15 @@ def _member_outputs(estimator, X, mesh):
   t_blk = max(_round_up(max(t1 - t0 for t0, t1 in bounds_t), _PAD), _PAD)
 
   graphdef, state = nnx.split(estimator.model)
-  state = jax.device_put(state, NamedSharding(mesh, P()))
+  if jax.process_count() > 1:
+    # Multi-process: the params are a process-local array, and device_put
+    # cannot move one onto a sharding spanning all global devices ("CopyArrays
+    # only supports destination device list of the same size as the array
+    # device lists"). Every process holds an identical full copy, so lift them
+    # to a globally replicated array instead.
+    state = multihost_utils.host_local_array_to_global_array(state, mesh, P())
+  else:
+    state = jax.device_put(state, NamedSharding(mesh, P()))
   has_cat = cat_masks is not None
   has_d = ds is not None
   fwd = _make_forward(graphdef, c_blk, t_blk, has_cat, has_d)
@@ -352,7 +361,12 @@ def _member_outputs(estimator, X, mesh):
 
 
 def _default_mesh():
-  return jax.make_mesh((len(jax.devices()),), (_AXIS,))
+  # Order devices so each host's local chips are contiguous along the mesh
+  # axis. jax.make_mesh's default flat ordering interleaves hosts, and pjit
+  # rejects host-local inputs unless one host's devices form a contiguous
+  # subcube of the global mesh.
+  devices = sorted(jax.devices(), key=lambda d: (d.process_index, d.id))
+  return jax.sharding.Mesh(np.array(devices, dtype=object), (_AXIS,))
 
 
 def predict(estimator, X, mesh=None):
