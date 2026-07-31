@@ -116,8 +116,8 @@ def load(
 ) -> "TabFM_HF":
   """Loads the PyTorch TabFM v1.1.0 model with pre-trained weights.
 
-  The checkpoint is stored in float32, but the model is designed to run in
-  bfloat16 (matching the JAX release's ``dtype=jnp.bfloat16`` compute default),
+  The checkpoint is stored in bfloat16, matching the training dtype and the
+  JAX release (which computes in ``jnp.bfloat16``),
   with a few internal fp32 upcasts. ``dtype`` casts the model accordingly; pass
   ``None`` to keep the float32 weights.
 
