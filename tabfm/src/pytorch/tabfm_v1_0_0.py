@@ -58,7 +58,7 @@ class TabFM_HF(
     subfolder = model_kwargs.pop("subfolder", None)
 
     def _apply_config(cfg):
-      if "is_classifier" not in model_kwargs and "task" in cfg:
+      if model_kwargs.get("is_classifier") is None and "task" in cfg:
         model_kwargs["is_classifier"] = cfg.pop("task") == "classification"
       for key in ("model_type", "version", "framework"):
         cfg.pop(key, None)
@@ -154,7 +154,11 @@ def load(
           "Downloading TabFM v1.0.0 PyTorch %s weights from Hugging Face...",
           model_type,
       )
-      model = TabFM_HF.from_pretrained(HF_REPO_ID, subfolder=model_type)
+      model = TabFM_HF.from_pretrained(
+          HF_REPO_ID,
+          subfolder=model_type,
+          is_classifier=(model_type == "classification"),
+      )
     else:
       local_dir = checkpoint_path
       if not os.path.isdir(local_dir):
@@ -163,14 +167,10 @@ def load(
       if os.path.isdir(sub):
         local_dir = sub
 
-      if os.path.exists(os.path.join(local_dir, "config.json")):
-        model = TabFM_HF.from_pretrained(local_dir)
-      else:
-        # no config.json: pass is_classifier explicitly
-        model = TabFM_HF.from_pretrained(
-            local_dir,
-            is_classifier=(model_type == "classification"),
-        )
+      model = TabFM_HF.from_pretrained(
+          local_dir,
+          is_classifier=(model_type == "classification"),
+      )
 
     if dtype is not None:
       model = model.to(dtype)  # engage the bf16 compute design (see docstring)
