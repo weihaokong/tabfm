@@ -92,3 +92,16 @@ py_library(
         "@pip//orbax_checkpoint",
     ],
 )
+
+py_library(
+    name = "tabfm_v1_1_0",
+    srcs = ["tabfm_v1_1_0.py"],
+    deps = [
+        ":checkpointing",
+        ":model",
+        "@pip//absl_py",
+        "@pip//flax",
+        "@pip//jax",
+        "@pip//orbax_checkpoint",
+    ],
+)
