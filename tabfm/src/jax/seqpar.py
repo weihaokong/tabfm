@@ -55,6 +55,7 @@ across devices so it is readable everywhere.
 import numpy as np
 
 import jax
+from jax.experimental import multihost_utils
 import jax.numpy as jnp
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -176,8 +177,16 @@ def _col_sharded(col, emb, c_blk, ts_local):
   return out.reshape(b, hc, t, e).transpose((0, 2, 1, 3))
 
 
-def _icl_block_sharded(blk, r, c_blk, key_bias):
-  """One ICL self-attention block; keys = all devices' context blocks."""
+def _icl_block_sharded(blk, r, c_blk, key_bias, splash_valid=None):
+  """One ICL self-attention block; keys = all devices' context blocks.
+
+  With ``splash_valid`` (bool ``[world * c_blk]`` key-validity vector) the
+  fused Pallas splash kernel is used instead of memory-efficient attention.
+  The sharding structure is identical either way -- local queries, all-gathered
+  KV -- only the local attention kernel changes. Both kernels apply no internal
+  scaling (mea follows the T5 convention with ``rescale_logits=False``; splash
+  scales nothing), so the pre-scaled q gives identical math.
+  """
   attn = blk.attn
   nh, hd = attn.num_heads, attn.head_dim
   xn = blk.pre_attn_ln(r)
@@ -189,25 +198,71 @@ def _icl_block_sharded(blk, r, c_blk, key_bias):
   key = jax.lax.all_gather(k, _AXIS, axis=1, tiled=True)
   val = jax.lax.all_gather(v, _AXIS, axis=1, tiled=True)
   tgt = q.shape[1]
-  ao = mea.dot_product_attention_multihead(
-      query=q,
-      key=key,
-      value=val,
-      bias=key_bias,
-      dtype=np.dtype(r.dtype.name),
-      enable_dropout=False,
-      query_chunk_size=_PAD if tgt >= _PAD else tgt,
-      key_chunk_size=_PAD,
-  )
+  if splash_valid is not None:
+    # Key-prefix validity as segment ids, exactly as model.py's SPLASH branch:
+    # queries carry segment 1, valid keys 1, padded keys 0; splash attends only
+    # within equal segments. Sequence lengths here are 128-multiples (c_blk is
+    # a _MAB1_KEY_CHUNK multiple, t_blk a _PAD multiple), so 128 blocks divide.
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel as _sak  # pylint: disable=g-import-not-at-top
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as _sam  # pylint: disable=g-import-not-at-top
+
+    src = key.shape[1]
+
+    def _blk(n, cap=512):
+      # Largest power-of-two block <= cap that divides n (lengths here are
+      # always 128-multiples). Larger blocks shrink the kernel's block-metadata
+      # tables in smem -- at 2-D mesh shapes (4x longer per-device sequences)
+      # fixed 128 blocks overflow the 1MB smem budget.
+      b = 128
+      while b * 2 <= cap and n % (b * 2) == 0:
+        b *= 2
+      return min(b, n)
+
+    kernel = _sak.make_splash_mha(
+        _sam.MultiHeadMask([_sam.FullMask((tgt, src))] * nh),
+        block_sizes=_sak.BlockSizes(block_q=_blk(tgt), block_kv=_blk(src)),
+        head_shards=1,
+        q_seq_shards=1,
+    )
+    ao = kernel(
+        q[0].transpose(1, 0, 2),  # splash takes [num_heads, seq, head_dim]
+        key[0].transpose(1, 0, 2),
+        val[0].transpose(1, 0, 2),
+        segment_ids=_sak.SegmentIds(
+            q=jnp.ones((tgt,), jnp.int32),
+            kv=splash_valid.astype(jnp.int32),
+        ),
+    ).transpose(1, 0, 2)[None]
+  else:
+    ao = mea.dot_product_attention_multihead(
+        query=q,
+        key=key,
+        value=val,
+        bias=key_bias,
+        dtype=np.dtype(r.dtype.name),
+        enable_dropout=False,
+        query_chunk_size=_PAD if tgt >= _PAD else tgt,
+        key_chunk_size=_PAD,
+    )
   o = attn.out_proj(ao.reshape(1, -1, nh * hd))
   x = r + blk.post_attn_ln(o)
   return x + blk._ff_block(x)  # pylint: disable=protected-access
 
 
-def _make_forward(graphdef, c_blk, t_blk, has_cat, has_d):
-  """Builds the per-device shard_map body for one ensemble member."""
+def _make_forward(graphdef, c_blk, t_blk, has_cat, has_d, two_d=False,
+                  splash=False):
+  """Builds the per-device shard_map body for one ensemble member.
+
+  With ``two_d=True`` the mesh has a second ``data`` axis (members batched
+  across it), which makes the per-device ``ts`` shard ``[1, 1]`` instead of
+  ``[1]``; flatten it so the rest of the body is identical. All sequence
+  collectives use ``_AXIS`` only, so they stay scoped to the seqpar axis and
+  are oblivious to the data axis.
+  """
 
   def forward(state, x, y, ts, cat_mask, d):
+    if two_d:
+      ts = ts.reshape(-1)
     m = nnx.merge(graphdef, state)
     dtype = m.dtype
     x = jnp.nan_to_num(x, nan=-100.0).astype(dtype)
@@ -238,18 +293,142 @@ def _make_forward(graphdef, c_blk, t_blk, has_cat, has_d):
     valid = (jnp.arange(c_blk)[None, :] < ts_all[:, None]).reshape(-1)
     key_bias = jnp.where(valid, 0.0, -1e30)[None, None, None, :]
     for blk in _iter_blocks(icl.tf_icl.blocks):
-      r = _icl_block_sharded(blk, r, c_blk, key_bias)
+      r = _icl_block_sharded(
+          blk, r, c_blk, key_bias, splash_valid=valid if splash else None
+      )
     out = icl.decoder(icl.ln(r))  # [1, T_local, L]
     return out[:, c_blk:, :]  # [1, t_blk, L]
 
   return forward
 
 
-def _member_outputs(estimator, X, mesh):
+_AXIS_DATA = "data"
+
+
+def _member_outputs_2d(estimator, X, mesh, splash=False):
+  """2-D (data x seqpar) variant of :func:`_member_outputs`.
+
+  The mesh has axes ``("data", _AXIS)`` of sizes ``D`` and ``S`` (D*S = world).
+  Each shard_map call runs ``D`` members concurrently -- one per ``data`` row --
+  with every member's sequence sharded across the ``S`` seqpar devices. The
+  per-device footprint is identical to the 1-D path (one member, one c_blk
+  context), so if 1-D seqpar fits, so does this; the win is running D members
+  per call instead of one.
+
+  Returns ``[n_members, n_test, L_out]`` float32 outputs.
+  """
+  x_enc = estimator.X_encoder_.transform(X)
+  data = estimator.ensemble_generator_.transform(x_enc)
+  xs, ys, cat_masks, ds, _ = (
+      estimator.ensemble_generator_.prepare_ensemble_tensors(data)
+  )
+  n_members = xs.shape[0]
+  n_train = ys.shape[1]
+  n_test = xs.shape[1] - n_train
+  h = xs.shape[-1]
+  d_shards = mesh.shape[_AXIS_DATA]
+  s_shards = mesh.shape[_AXIS]
+  if n_train < s_shards:
+    raise ValueError(
+        f"n_train ({n_train}) must be >= the seqpar shard count ({s_shards})."
+    )
+
+  bounds_c = [_shard_bounds(n_train, s_shards, r) for r in range(s_shards)]
+  bounds_t = [_shard_bounds(n_test, s_shards, r) for r in range(s_shards)]
+  c_blk = _round_up(max(c1 - c0 for c0, c1 in bounds_c), _MAB1_KEY_CHUNK)
+  t_blk = max(_round_up(max(t1 - t0 for t0, t1 in bounds_t), _PAD), _PAD)
+
+  graphdef, state = nnx.split(estimator.model)
+  if jax.process_count() > 1:
+    state = multihost_utils.host_local_array_to_global_array(state, mesh, P())
+  else:
+    state = jax.device_put(state, NamedSharding(mesh, P()))
+  has_cat = cat_masks is not None
+  has_d = ds is not None
+  fwd = _make_forward(graphdef, c_blk, t_blk, has_cat, has_d, two_d=True,
+                      splash=splash)
+
+  sharded = jax.jit(
+      jax.shard_map(
+          fwd,
+          mesh=mesh,
+          in_specs=(
+              P(),
+              P(_AXIS_DATA, _AXIS, None),
+              P(_AXIS_DATA, _AXIS),
+              P(_AXIS_DATA, _AXIS),
+              P(_AXIS_DATA, None),
+              P(_AXIS_DATA),
+          ),
+          out_specs=P(_AXIS_DATA, _AXIS, None),
+          check_vma=False,
+      ),
+      out_shardings=NamedSharding(mesh, P()),
+  )
+
+  x_shard = NamedSharding(mesh, P(_AXIS_DATA, _AXIS, None))
+  y_shard = NamedSharding(mesh, P(_AXIS_DATA, _AXIS))
+  ts_shard = NamedSharding(mesh, P(_AXIS_DATA, _AXIS))
+  cat_shard = NamedSharding(mesh, P(_AXIS_DATA, None))
+  d_shard = NamedSharding(mesh, P(_AXIS_DATA))
+
+  def to_global(arr, sharding):
+    return jax.make_array_from_callback(
+        arr.shape, sharding, lambda idx: arr[idx]
+    )
+
+  seq = c_blk + t_blk
+  outs = [None] * n_members
+  n_batches = (n_members + d_shards - 1) // d_shards
+  for b in range(n_batches):
+    m0 = b * d_shards
+    nb = min(d_shards, n_members - m0)  # real members in this batch
+    xg = np.zeros((d_shards, s_shards * seq, h), np.float32)
+    yg = np.full((d_shards, s_shards * seq), -100.0, np.float32)
+    ts_g = np.zeros((d_shards, s_shards), np.int32)
+    cat_g = np.zeros((d_shards, h), bool)
+    d_g = np.zeros((d_shards,), np.int32)
+    for di in range(nb):
+      mi = m0 + di
+      for r, ((c0, c1), (t0, t1)) in enumerate(zip(bounds_c, bounds_t)):
+        base = r * seq
+        xg[di, base : base + c1 - c0] = xs[mi, c0:c1]
+        yg[di, base : base + c1 - c0] = ys[mi, c0:c1]
+        xg[di, base + c_blk : base + c_blk + t1 - t0] = xs[
+            mi, n_train + t0 : n_train + t1
+        ]
+        ts_g[di, r] = c1 - c0
+      if has_cat:
+        cat_g[di] = np.asarray(cat_masks[mi])
+      if has_d:
+        d_g[di] = np.asarray(ds[mi], np.int32)
+    args = (
+        state,
+        to_global(xg, x_shard),
+        to_global(yg, y_shard),
+        to_global(ts_g, ts_shard),
+        to_global(cat_g, cat_shard),
+        to_global(d_g, d_shard),
+    )
+    out = np.asarray(
+        jax.block_until_ready(sharded(*args)), np.float32
+    )  # [D, S*t_blk, L]
+    for di in range(nb):
+      parts = [
+          out[di, r * t_blk : r * t_blk + (t1 - t0)]
+          for r, (t0, t1) in enumerate(bounds_t)
+      ]
+      outs[m0 + di] = np.concatenate(parts, axis=0)
+  return np.stack(outs, axis=0)
+
+
+def _member_outputs(estimator, X, mesh, splash=False):
   """Runs every ensemble member through the sharded forward.
 
   Returns ``[n_members, n_test, L_out]`` float32 outputs.
   """
+  if _AXIS_DATA in mesh.axis_names:
+    return _member_outputs_2d(estimator, X, mesh, splash=splash)
   x_enc = estimator.X_encoder_.transform(X)
   data = estimator.ensemble_generator_.transform(x_enc)
   xs, ys, cat_masks, ds, _ = (
@@ -271,10 +450,18 @@ def _member_outputs(estimator, X, mesh):
   t_blk = max(_round_up(max(t1 - t0 for t0, t1 in bounds_t), _PAD), _PAD)
 
   graphdef, state = nnx.split(estimator.model)
-  state = jax.device_put(state, NamedSharding(mesh, P()))
+  if jax.process_count() > 1:
+    # Multi-process: the params are a process-local array, and device_put
+    # cannot move one onto a sharding spanning all global devices ("CopyArrays
+    # only supports destination device list of the same size as the array
+    # device lists"). Every process holds an identical full copy, so lift them
+    # to a globally replicated array instead.
+    state = multihost_utils.host_local_array_to_global_array(state, mesh, P())
+  else:
+    state = jax.device_put(state, NamedSharding(mesh, P()))
   has_cat = cat_masks is not None
   has_d = ds is not None
-  fwd = _make_forward(graphdef, c_blk, t_blk, has_cat, has_d)
+  fwd = _make_forward(graphdef, c_blk, t_blk, has_cat, has_d, splash=splash)
   # The output is re-replicated across all devices so that every process of a
   # multi-process (e.g. multi-host TPU) run can read it back directly; the
   # gathered tensor is tiny ([1, W * t_blk, L]).
@@ -352,18 +539,62 @@ def _member_outputs(estimator, X, mesh):
 
 
 def _default_mesh():
-  return jax.make_mesh((len(jax.devices()),), (_AXIS,))
+  # Order devices so each host's local chips are contiguous along the mesh
+  # axis. jax.make_mesh's default flat ordering interleaves hosts, and pjit
+  # rejects host-local inputs unless one host's devices form a contiguous
+  # subcube of the global mesh.
+  devices = sorted(jax.devices(), key=lambda d: (d.process_index, d.id))
+  return jax.sharding.Mesh(np.array(devices, dtype=object), (_AXIS,))
 
 
-def predict(estimator, X, mesh=None):
-  """Sharded equivalent of ``TabFMRegressor.predict``."""
-  outputs = _member_outputs(estimator, X, mesh or _default_mesh())
+def make_mesh_2d(data_shards):
+  """Builds a 2-D (data x seqpar) mesh for batched-member sequence sharding.
+
+  Devices are ordered (process_index, id) and reshaped to
+  ``(data_shards, world // data_shards)``. With one host per data row (e.g.
+  data_shards == process_count on a slice with 1 host per process), the seqpar
+  all_gathers stay intra-host while the data axis spans hosts, and each data
+  row is a contiguous subcube as pjit requires.
+  """
+  devices = sorted(jax.devices(), key=lambda d: (d.process_index, d.id))
+  world = len(devices)
+  if world % data_shards:
+    raise ValueError(
+        f"data_shards ({data_shards}) must divide device count ({world})."
+    )
+  grid = np.array(devices, dtype=object).reshape(data_shards, world // data_shards)
+  return jax.sharding.Mesh(grid, (_AXIS_DATA, _AXIS))
+
+
+def _resolve_splash(splash, mesh):
+  """None -> auto: splash on TPU (where the Pallas kernel runs), mea elsewhere."""
+  if splash is None:
+    return mesh.devices.flat[0].platform == "tpu"
+  return splash
+
+
+def predict(estimator, X, mesh=None, splash=None):
+  """Sharded equivalent of ``TabFMRegressor.predict``.
+
+  ``splash=None`` (default) auto-selects the attention kernel: the fused
+  Pallas splash kernel on TPU, memory-efficient attention elsewhere. Pass
+  True/False to force.
+  """
+  mesh = mesh or _default_mesh()
+  outputs = _member_outputs(estimator, X, mesh,
+                            splash=_resolve_splash(splash, mesh))
   return estimator._combine_predictions(outputs.squeeze(-1))  # pylint: disable=protected-access
 
 
-def predict_proba(estimator, X, mesh=None):
-  """Sharded equivalent of ``TabFMClassifier.predict_proba``."""
-  outputs = _member_outputs(estimator, X, mesh or _default_mesh())
+def predict_proba(estimator, X, mesh=None, splash=None):
+  """Sharded equivalent of ``TabFMClassifier.predict_proba``.
+
+  ``splash=None`` (default) auto-selects the attention kernel, as in
+  :func:`predict`.
+  """
+  mesh = mesh or _default_mesh()
+  outputs = _member_outputs(estimator, X, mesh,
+                            splash=_resolve_splash(splash, mesh))
   outputs = outputs[..., : estimator.n_classes_]
   offsets = []
   for offs in estimator.ensemble_generator_.class_shift_offsets_.values():
