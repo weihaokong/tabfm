@@ -852,5 +852,121 @@ class TabFMPrefillDecodeTest(parameterized.TestCase):
     chex.assert_trees_all_close(out_full_test, out_decode, atol=0.2, rtol=0.1)
 
 
+class RetrievalDecoderTest(parameterized.TestCase):
+  """Tests for the TabPFN-3-style attention retrieval decoder."""
+
+  def setUp(self):
+    super().setUp()
+    self.rngs = nnx.Rngs(0)
+
+  def test_matches_numpy_reference(self):
+    B, M, N, E, K, H, D = 2, 3, 7, 16, 5, 2, 4
+    dec = tabfm_model.RetrievalDecoder(
+        d_model=E, max_classes=K, head_dim=D, num_heads=H,
+        rngs=self.rngs, dtype=jnp.float32,
+    )
+    q_in = jax.random.normal(jax.random.PRNGKey(1), (B, M, E))
+    k_in = jax.random.normal(jax.random.PRNGKey(2), (B, N, E))
+    y = jax.random.randint(jax.random.PRNGKey(3), (B, N), 0, K)
+    mask = jnp.arange(N)[None, :] < jnp.array([5, 7])[:, None]
+
+    # Pin true-fp32 matmuls so the comparison against the float32 NumPy
+    # reference holds on GPUs too (Ampere defaults fp32 matmuls to TF32).
+    with jax.default_matmul_precision('highest'):
+      out = dec(q_in, k_in, y, mask)
+
+    def project(x, lin):
+      return np.asarray(x) @ np.asarray(lin.kernel.value) + np.asarray(
+          lin.bias.value
+      )
+
+    q = project(q_in, dec.q_proj).reshape(B, M, H, D)
+    k = project(k_in, dec.k_proj).reshape(B, N, H, D)
+    scores = np.einsum('bmhd,bnhd->bhmn', q, k) / np.sqrt(D)
+    scores = np.where(np.asarray(mask)[:, None, None, :], scores, -1e30)
+    scores -= scores.max(axis=-1, keepdims=True)
+    attn = np.exp(scores) / np.exp(scores).sum(axis=-1, keepdims=True)
+    one_hot = np.eye(K)[np.asarray(y)]
+    p = np.einsum('bhmn,bnk->bmk', attn, one_hot) / H
+    ref = np.log(np.clip(p, 1e-5, None) + 3e-5)
+
+    chex.assert_shape(out, (B, M, K))
+    chex.assert_trees_all_close(out, ref.astype(np.float32), atol=1e-4)
+
+  def test_masked_rows_get_zero_weight(self):
+    # A class that appears ONLY in masked key rows must receive exactly zero
+    # retrieval probability, i.e. the clipped-log floor log(1e-5 + 3e-5).
+    B, M, N, E, K = 1, 4, 6, 8, 3
+    dec = tabfm_model.RetrievalDecoder(
+        d_model=E, max_classes=K, head_dim=4, num_heads=2,
+        rngs=self.rngs, dtype=jnp.float32,
+    )
+    q_in = jax.random.normal(jax.random.PRNGKey(1), (B, M, E))
+    k_in = jax.random.normal(jax.random.PRNGKey(2), (B, N, E))
+    # Class 2 only occurs in the last two (masked) rows.
+    y = jnp.array([[0, 1, 0, 1, 2, 2]])
+    mask = jnp.array([[True, True, True, True, False, False]])
+    out = dec(q_in, k_in, y, mask)
+    floor = np.log(1e-5 + 3e-5)
+    np.testing.assert_allclose(np.asarray(out[..., 2]), floor, rtol=1e-6)
+
+  def test_retrieval_decoder_rejects_regression(self):
+    with self.assertRaises(ValueError):
+      tabfm_model.ICLearning(
+          loss='mse', max_classes=1, d_model=8, num_blocks=1, nhead=2,
+          dim_feedforward=16, decoder_type='retrieval', rngs=self.rngs,
+          dtype=jnp.float32,
+      )
+
+  def test_prefill_decode_consistency_with_retrieval_head(self):
+    # Mirrors TabFMPrefillDecodeTest for icl_decoder_type='retrieval': the
+    # decode path retrieves against the cached prefill train embeddings and
+    # must match the full forward pass on the test portion.
+    B, T, H = 1, 20, 4
+    train_len = 10
+    max_classes = 5
+
+    model = tabfm_model.TabFM(
+        loss='cross_entropy',
+        max_classes=max_classes,
+        embed_dim=32,
+        col_num_blocks=1,
+        row_num_blocks=1,
+        icl_num_blocks=2,
+        col_nhead=2,
+        row_nhead=2,
+        icl_nhead=2,
+        icl_decoder_type='retrieval',
+        decoder_head_dim=8,
+        decoder_num_heads=2,
+        rngs=self.rngs,
+        dtype=jnp.float32,
+    )
+    _init_model_deterministically(model)
+    state = nnx.state(model, nnx.Param)
+    flat_state = nnx.to_flat_state(state)
+    new_state_dict = {}
+    for path, var in flat_state:
+      new_state_dict[path] = var.value * 0.02
+    nnx.update(model, nnx.State.from_flat_path(new_state_dict))
+
+    X = jax.random.normal(self.rngs.params(), (B, T, H))
+    y = jax.random.randint(self.rngs.params(), (B, T), 0, max_classes)
+    train_size = jnp.array([train_len])
+
+    out_full = model(X, y, train_size)
+    chex.assert_shape(out_full, (B, T, max_classes))
+    out_full_test = out_full[:, train_len:, :]
+
+    _, cache = model.prefill(X[:, :train_len, :], y[:, :train_len])
+    icl_cache = cache['icl']
+    self.assertIsInstance(icl_cache, tabfm_model.ICLearningCache)
+    self.assertIsNotNone(icl_cache.train_embeddings)
+    self.assertIsNotNone(icl_cache.train_y)
+
+    out_decode = model.decode(X[:, train_len:, :], cache)
+    chex.assert_trees_all_close(out_full_test, out_decode, atol=0.2, rtol=0.1)
+
+
 if __name__ == '__main__':
   absltest.main()

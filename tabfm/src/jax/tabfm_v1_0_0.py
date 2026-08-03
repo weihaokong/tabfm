@@ -63,6 +63,12 @@ class Config:
       YEmbeddingScheme.ADD_Y_TO_X_POST_EMBEDDING
   )
   use_bias: bool = False
+  # ICL output head: "mlp" (the released checkpoints) or "retrieval"
+  # (TabPFN-3-style attention retrieval over the in-context train labels;
+  # classification only, W_Q/W_K projections require training).
+  icl_decoder_type: str = "mlp"
+  decoder_head_dim: int = 64
+  decoder_num_heads: int = 6
 
   def to_dict(self) -> Dict[str, Any]:
     return {
@@ -90,6 +96,9 @@ class Config:
         "cache_icl_input_only": self.cache_icl_input_only,
         "y_embedding_scheme": self.y_embedding_scheme,
         "use_bias": self.use_bias,
+        "icl_decoder_type": self.icl_decoder_type,
+        "decoder_head_dim": self.decoder_head_dim,
+        "decoder_num_heads": self.decoder_num_heads,
     }
 
 
