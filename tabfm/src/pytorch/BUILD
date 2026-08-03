@@ -21,6 +21,17 @@ py_library(
     ],
 )
 
+py_library(
+    name = "tabfm_v1_1_0",
+    srcs = ["tabfm_v1_1_0.py"],
+    deps = [
+        ":model",
+        "@pip//absl_py",
+        "@pip//torch",
+        "@pip//huggingface_hub",
+    ],
+)
+
 py_test(
     name = "model_test",
     srcs = ["model_test.py"],

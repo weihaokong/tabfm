@@ -18,6 +18,7 @@ from unittest import mock
 from absl.testing import absltest
 import numpy as np
 import pandas as pd
+from sklearn import config_context
 from sklearn.exceptions import NotFittedError
 
 try:
@@ -1198,6 +1199,26 @@ class ColumnNameRobustnessTest(absltest.TestCase):
     out = TransformToNumerical().fit_transform(X)
 
     self.assertEqual(out.shape, (4, 5))  # unix-ns + 4 derived features
+
+
+class GlobalPandasOutputTest(absltest.TestCase):
+  """Fit must ignore a user's global transform_output="pandas" config."""
+
+  def test_regressor_fit_with_pandas_output_config(self):
+    # A user who calls sklearn.set_config(transform_output="pandas") used to
+    # crash the regressor: the internal target StandardScaler returned a
+    # DataFrame, and `.flatten()` on it raised AttributeError. See issue #58.
+    regressor = TabFMRegressor(n_estimators=2, model=mock.Mock())
+
+    X = np.random.rand(10, 4)
+    y = np.random.rand(10)
+
+    with config_context(transform_output="pandas"):
+      regressor.fit(X, y)
+      # The target scaler stays pinned to ndarray output under the config.
+      scaled = regressor.y_scaler_.transform(y.reshape(-1, 1))
+
+    self.assertIsInstance(scaled, np.ndarray)
 
 
 if __name__ == "__main__":
