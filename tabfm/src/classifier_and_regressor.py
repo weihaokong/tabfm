@@ -3430,6 +3430,10 @@ class TabFMRegressor(RegressorMixin, BaseEstimator):
     cat_features = list(range(n_cat))
 
     self.y_scaler_ = StandardScaler()
+    # Keep ndarray output even if the user set a global
+    # sklearn.set_config(transform_output="pandas"): otherwise fit_transform
+    # returns a DataFrame, which has no .flatten().
+    self.y_scaler_.set_output(transform="default")
     y = self.y_scaler_.fit_transform(y.reshape(-1, 1)).flatten()
 
     self.ensemble_generator_ = EnsembleGenerator(

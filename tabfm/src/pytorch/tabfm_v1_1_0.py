@@ -22,7 +22,7 @@ from huggingface_hub import PyTorchModelHubMixin, constants, snapshot_download
 
 from tabfm.src.pytorch.model import TabFM
 
-HF_REPO_ID = "google/tabfm-1.0.0-pytorch"
+HF_REPO_ID = "google/tabfm-1.1.0-pytorch"
 
 _LOAD_CACHE_LOCK = threading.Lock()
 _LOAD_CACHE: Dict[Any, "TabFM_HF"] = {}
@@ -114,10 +114,10 @@ def load(
     dtype: Any = torch.bfloat16,
     use_cache: bool = True,
 ) -> "TabFM_HF":
-  """Loads the PyTorch TabFM v1.0.0 model with pre-trained weights.
+  """Loads the PyTorch TabFM v1.1.0 model with pre-trained weights.
 
-  The checkpoint is stored in float32, but the model is designed to run in
-  bfloat16 (matching the JAX release's ``dtype=jnp.bfloat16`` compute default),
+  The checkpoint is stored in bfloat16, matching the training dtype and the
+  JAX release (which computes in ``jnp.bfloat16``),
   with a few internal fp32 upcasts. ``dtype`` casts the model accordingly; pass
   ``None`` to keep the float32 weights.
 
@@ -151,7 +151,7 @@ def load(
 
     if checkpoint_path is None:
       logging.info(
-          "Downloading TabFM v1.0.0 PyTorch %s weights from Hugging Face...",
+          "Downloading TabFM v1.1.0 PyTorch %s weights from Hugging Face...",
           model_type,
       )
       model = TabFM_HF.from_pretrained(
