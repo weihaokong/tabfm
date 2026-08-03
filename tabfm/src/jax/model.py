@@ -95,7 +95,13 @@ class AttentionImplementation(str, enum.Enum):
 # memory. Chunking is pointwise-exact (each token's FFN is independent), so the
 # output is bit-identical to the unchunked path. Set before the first predict --
 # it is read as a compile-time constant when the model is traced.
-FFN_CHUNK_SIZE = None
+#
+# On by default with the same size the PyTorch port applies in ``TabFM``'s
+# constructor: chunking is exact and a no-op when the input is smaller than the
+# chunk, so the default costs nothing on small tasks and keeps wide/tall ones
+# (e.g. TabArena's 212-feature kddcup09) from OOMing out of the box. Set to
+# ``None`` to disable, e.g. for benchmarking the unchunked path.
+FFN_CHUNK_SIZE = 8192
 
 
 def set_ffn_chunk_size(n):
@@ -109,8 +115,9 @@ def set_ffn_chunk_size(n):
 # each row, so the flattened ``B*T`` row axis is an independent batch dimension:
 # processing it ``ROW_CHUNK_SIZE`` rows at a time is exact and bounds the
 # ``[rows, heads, HC, HC]`` attention-score buffer that otherwise scales with
-# the full row count (30+ GiB on wide/tall tasks).
-ROW_CHUNK_SIZE = None
+# the full row count (30+ GiB on wide/tall tasks). On by default, matching the
+# PyTorch port (see the note on ``FFN_CHUNK_SIZE``); ``None`` disables.
+ROW_CHUNK_SIZE = 4096
 
 
 def set_row_chunk_size(n):
@@ -123,7 +130,9 @@ def set_row_chunk_size(n):
 # ``col_chunk_size``). The column set-transformer runs with the flattened
 # ``B*HC`` column axis as its batch dimension (attention is over rows within
 # each column), so processing it ``COL_CHUNK_SIZE`` columns at a time is exact.
-COL_CHUNK_SIZE = None
+# On by default, matching the PyTorch port (see ``FFN_CHUNK_SIZE``); ``None``
+# disables.
+COL_CHUNK_SIZE = 16
 
 
 def set_col_chunk_size(n):
