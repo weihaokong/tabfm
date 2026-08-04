@@ -19,24 +19,41 @@ Self-contained cross-machine comparison. Prints the full environment
 the metrics so two machines' results can be diffed unambiguously.
 
     pip install -e .[jax,examples] scikit-learn
-    python repro_kddcup_jax.py                 # jax, bf16, default + ensemble
-    python repro_kddcup_jax.py --dtype f32     # jax, float32
+    python repro_kddcup_jax.py --n-estimators 1              # 1-member, bf16
+    python repro_kddcup_jax.py --n-estimators 1 --dtype f32  # the control
+    python repro_kddcup_jax.py                               # full 32-member
     python repro_kddcup_jax.py --backend pytorch
-    python repro_kddcup_jax.py --quick         # 3k-row context (fast smoke)
+    python repro_kddcup_jax.py --quick                       # fast smoke test
 
-Reference numbers measured on 1x H100 (jax 0.10.1, cuda12 wheels):
+Reference numbers, 1x H100 (jax 0.10.1, cuda12 wheels), kddcup09 fold 0.
+Single ensemble member (``--n-estimators 1``), so timings are per member:
 
-    backend  dtype  preset     AUC      log-loss
-    jax      bf16   default    0.7192   0.1096
-    jax      bf16   ensemble   0.7801   0.0843
-    jax      f32    default    0.8311   0.0762
-    pytorch  bf16   default    0.8262   0.0775
-    pytorch  f32    default    0.8312   0.0762
+    backend  dtype  matmul     AUC      predict
+    jax      bf16   -          0.7697   81 s
+    jax      f32    default    0.8311   83 s     <- TF32 tensor cores
+    jax      f32    highest    0.8312   108 s    <- true fp32
+    pytorch  bf16   -          0.8262   ~4 s
+    pytorch  f32    -          0.8312   -
 
-A machine reporting materially better bf16 numbers than the above is the
-interesting case: the fp32 rows agree across backends, so bf16 spread is a
-precision-sensitivity effect on this dataset (1.8% positive rate, 212
-features, wide dynamic range).
+Full 32-member presets (``--n-estimators 32``, the default):
+
+    jax      bf16   default    0.7192   36 min
+    jax      bf16   ensemble   0.7801   55 min
+    pytorch  bf16   default    0.8262   ~2 min
+
+Two things this dataset exposes:
+
+* Precision. bf16 (7-bit mantissa) loses ~0.06 AUC here; TF32 (10-bit,
+  what ``dtype=float32`` uses by default on Ampere+) recovers all of it,
+  and true fp32 (23-bit) adds nothing beyond TF32. The dataset is 1.8%
+  positive with 212 features and a wide dynamic range.
+* Kernel choice, not arithmetic, dominates JAX runtime: the same bf16
+  forward takes 81 s with the chunked ``flash`` scan and 13.7 s with fused
+  cuDNN (``--attn cudnn``), which is why halving precision barely changes
+  the total.
+
+A machine reporting materially better *bf16* numbers than the above is the
+interesting case; the f32 rows should agree everywhere.
 """
 
 import argparse
@@ -66,7 +83,7 @@ def load_fold0(quick=False):
   return x_train, y_train, x_test, y_test
 
 
-def describe_env(backend, dtype_flag):
+def describe_env(backend, dtype_flag):  # pylint: disable=missing-function-docstring
   """Prints everything that could make two machines disagree."""
   import platform
 
@@ -127,9 +144,20 @@ def main():
   p.add_argument("--attn", default="default",
                  help="jax only: 'default', 'flash', 'cudnn', 'jax'")
   p.add_argument("--presets", default="default,ensemble")
+  p.add_argument("--n-estimators", type=int, default=None,
+                 help="override the preset's member count (1 = fastest "
+                      "apples-to-apples comparison)")
+  p.add_argument("--matmul", choices=["default", "highest"], default="default",
+                 help="jax float32 matmul precision: 'default' uses TF32 "
+                      "tensor cores on Ampere+, 'highest' forces true fp32")
   p.add_argument("--quick", action="store_true",
                  help="3k-row context instead of the full 33k fold")
   args = p.parse_args()
+
+  if args.backend == "jax" and args.matmul == "highest":
+    import jax
+
+    jax.config.update("jax_default_matmul_precision", "highest")
 
   from sklearn.metrics import log_loss, roc_auc_score
 
@@ -144,10 +172,13 @@ def main():
 
   model = build_model(args.backend, args.dtype, args.attn)
   for preset in args.presets.split(","):
+    kw = {"random_state": 0}
+    if args.n_estimators is not None:
+      kw["n_estimators"] = args.n_estimators
     est = (
-        tabfm.TabFMClassifier.ensemble(model=model, random_state=0)
+        tabfm.TabFMClassifier.ensemble(model=model, **kw)
         if preset == "ensemble"
-        else tabfm.TabFMClassifier(model=model, random_state=0)
+        else tabfm.TabFMClassifier(model=model, **kw)
     )
     t0 = time.time()
     est.fit(x_train, y_train)
@@ -155,7 +186,9 @@ def main():
     elapsed = time.time() - t0
     y_idx = (np.asarray(y_test) == est.classes_[1]).astype(int)
     auc = roc_auc_score(y_idx, probs[:, 1])
-    print(f"{args.backend:<8} {args.dtype:<5} {preset:<9} "
+    n_members = kw.get("n_estimators", 32)
+    print(f"{args.backend:<8} {args.dtype:<5} matmul={args.matmul:<8} "
+          f"{preset:<9} n_est={n_members:<3} "
           f"AUC={auc:.4f}  log-loss={log_loss(y_idx, probs[:, 1]):.5f}  "
           f"({elapsed:.0f}s)")
 
