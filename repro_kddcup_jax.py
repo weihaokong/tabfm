@@ -32,14 +32,22 @@ Single ensemble member (``--n-estimators 1``), so timings are per member:
     jax      bf16   -          0.7697   81 s
     jax      f32    default    0.8311   83 s     <- TF32 tensor cores
     jax      f32    highest    0.8312   108 s    <- true fp32
-    pytorch  bf16   -          0.8262   ~4 s
+    pytorch  bf16   -          0.7287   8 s
     pytorch  f32    -          0.8312   -
+
+bf16 costs ~0.10 AUC per member on BOTH backends here; fp32 recovers it and
+the two backends then agree to 1e-4 (0.8311 vs 0.8312).
 
 Full 32-member presets (``--n-estimators 32``, the default):
 
     jax      bf16   default    0.7192   36 min
     jax      bf16   ensemble   0.7801   55 min
     pytorch  bf16   default    0.8262   ~2 min
+
+Note the asymmetry: averaging 32 bf16 members *helps* PyTorch (0.7287 ->
+0.8262) but *hurts* JAX (0.7697 -> 0.7192). Per-member accuracy is similar,
+so the divergence is in how the ensemble combines bf16 members, not in the
+forward pass.
 
 Two things this dataset exposes:
 
